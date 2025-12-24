@@ -1,0 +1,23 @@
+# Polymarket Prediction System Dependencies
+# Install: pip install -r requirements.txt
+
+# Data & ML
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# Advanced ML (State-of-the-Art)
+xgboost>=2.0.0
+lightgbm>=4.0.0
+optuna>=3.4.0
+
+# Model Interpretability
+shap>=0.44.0
+
+# API & Web
+requests>=2.31.0
+websocket-client>=1.6.0
+
+# Visualization (optional)
+matplotlib>=3.7.0
+seaborn>=0.12.0

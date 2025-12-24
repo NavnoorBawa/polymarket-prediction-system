@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sensitive files
+.env
+*.env
+credentials.json
+config.json
+secrets.json
+*.key
+*.pem
+
+# Data files (if any)
+*.csv
+*.json
+data/
+*.db
+*.sqlite
+
+# Model files
+*.pkl
+*.h5
+*.joblib
+models/
+
+# Logs
+*.log
+logs/
