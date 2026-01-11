@@ -3,6 +3,7 @@ Polymarket Data Fetcher - Enhanced Version
 Robust API client with retry logic, caching, and rate limiting
 """
 
+import os
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -45,18 +46,30 @@ class PolymarketFetcher:
     DATA_URL = "https://data-api.polymarket.com"
     
     def __init__(self, verbose: bool = False, cache_ttl: int = 300, 
-                 timeout: int = 30, max_retries: int = 3):
+                 timeout: int = 30, max_retries: int = 3, api_key: str = None):
         self.verbose = verbose
         self.cache_ttl = cache_ttl
         self.default_timeout = timeout
         
+        # Get API key from parameter or environment variable
+        self.api_key = api_key or os.getenv('POLYMARKET_API_KEY')
+        
         # Session with connection pooling and retry adapter (best practice)
         self.session = requests.Session()
-        self.session.headers.update({
+        headers = {
             'User-Agent': 'PolymarketPredictor/3.0',
             'Accept': 'application/json',
             'Connection': 'keep-alive'
-        })
+        }
+        
+        # Add Polymarket API key to headers if provided
+        # Polymarket CLOB API uses POLY_API_KEY header (not Authorization Bearer)
+        if self.api_key:
+            headers['POLY_API_KEY'] = self.api_key
+            if verbose:
+                print(f"[Fetcher] API key configured (length: {len(self.api_key)})")
+        
+        self.session.headers.update(headers)
         
         # Configure retry strategy with exponential backoff
         retry_strategy = Retry(
@@ -80,6 +93,8 @@ class PolymarketFetcher:
         # Cache
         self._markets_cache: Dict[str, dict] = {}
         self._cache_timestamps: Dict[str, datetime] = {}
+        self._tags_cache: Dict[str, dict] = {}
+        self._tags_cache_timestamps: Dict[str, datetime] = {}
     
     def _log(self, message: str):
         if self.verbose:
@@ -111,16 +126,28 @@ class PolymarketFetcher:
                     time.sleep(2 ** attempt)  # Exponential backoff
                     
             except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 429:  # Rate limited
+                status_code = e.response.status_code
+                if status_code == 429:  # Rate limited
                     wait_time = 5 * (2 ** attempt)
                     self._log(f"Rate limited, waiting {wait_time}s")
                     time.sleep(wait_time)
-                elif e.response.status_code >= 500:
-                    self._log(f"Server error {e.response.status_code}")
+                elif status_code == 401:  # Unauthorized
+                    self._log(f"Authentication failed (401): Check API key. Response: {e.response.text[:200]}")
+                    return None  # Don't retry on auth errors
+                elif status_code == 403:  # Forbidden
+                    self._log(f"Access forbidden (403): API key may not have required permissions. Response: {e.response.text[:200]}")
+                    return None  # Don't retry on permission errors
+                elif status_code >= 500:
+                    self._log(f"Server error {status_code}")
                     if attempt < retries - 1:
                         time.sleep(2 ** attempt)
                 else:
-                    self._log(f"HTTP {e.response.status_code}: {url}")
+                    # Log response details for debugging (4xx errors)
+                    try:
+                        error_detail = e.response.text[:200] if hasattr(e.response, 'text') else 'No response body'
+                        self._log(f"HTTP {status_code}: {url} - {error_detail}")
+                    except:
+                        self._log(f"HTTP {status_code}: {url}")
                     return None
                     
             except requests.exceptions.RequestException as e:
@@ -134,11 +161,20 @@ class PolymarketFetcher:
         
         return None
     
-    def _is_cache_valid(self, key: str) -> bool:
-        """Check if cached data is still valid"""
-        if key not in self._cache_timestamps:
+    def _is_cache_valid(self, key: str, cache_timestamps: Dict[str, datetime] = None) -> bool:
+        """
+        Check if cached data is still valid
+        
+        Args:
+            key: Cache key to check
+            cache_timestamps: Optional cache timestamps dict (default: uses _cache_timestamps)
+        
+        Returns: True if cache is valid, False otherwise
+        """
+        timestamps = cache_timestamps if cache_timestamps is not None else self._cache_timestamps
+        if key not in timestamps:
             return False
-        age = (datetime.now() - self._cache_timestamps[key]).total_seconds()
+        age = (datetime.now() - timestamps[key]).total_seconds()
         return age < self.cache_ttl
     
     # =========================================================================
@@ -226,6 +262,255 @@ class PolymarketFetcher:
         return matching[:limit]
     
     # =========================================================================
+    # GAMMA API - Tags and Categories
+    # =========================================================================
+    
+    def get_tags(self, limit: int = 200, offset: int = 0) -> List[Dict]:
+        """
+        Fetch tags (categories) from Gamma API with caching.
+        
+        Tags represent categories in Polymarket (e.g., Crypto, Politics, Sports).
+        
+        Args:
+            limit: Maximum number of tags to fetch (default: 200)
+            offset: Pagination offset (default: 0)
+        
+        Returns: List of tag dictionaries (categories)
+        """
+        cache_key = f"tags_{limit}_{offset}"
+        
+        if cache_key in self._tags_cache and self._is_cache_valid(cache_key, cache_timestamps=self._tags_cache_timestamps):
+            self._log("Using cached tags")
+            return self._tags_cache[cache_key]
+        
+        url = f"{self.GAMMA_URL}/tags"
+        params = {
+            'limit': limit,
+            'offset': offset
+        }
+        
+        self._log(f"Fetching tags: limit={limit}, offset={offset}")
+        
+        data = self._request(url, params)
+        
+        if data:
+            self._tags_cache[cache_key] = data
+            self._tags_cache_timestamps[cache_key] = datetime.now()
+            
+            # Also cache individual tags
+            for tag in data:
+                tag_id = tag.get('id')
+                tag_slug = tag.get('slug')
+                if tag_id:
+                    self._tags_cache[f"tag_id_{tag_id}"] = tag
+                    self._tags_cache_timestamps[f"tag_id_{tag_id}"] = datetime.now()
+                if tag_slug:
+                    self._tags_cache[f"tag_slug_{tag_slug}"] = tag
+                    self._tags_cache_timestamps[f"tag_slug_{tag_slug}"] = datetime.now()
+            
+            self._log(f"Fetched {len(data)} tags")
+            return data
+        
+        # Return cached data if API fails
+        if cache_key in self._tags_cache:
+            self._log("API failed, using stale cache")
+            return self._tags_cache[cache_key]
+        
+        return []
+    
+    def find_tag_by_label(
+        self, 
+        target_label: str, 
+        page_size: int = 200, 
+        max_pages: int = 50
+    ) -> Tuple[Optional[str], Optional[str], Optional[Dict]]:
+        """
+        Find a tag by exact label match, searching through paginated results.
+        
+        This is more robust than fetching a single page, as it handles cases
+        where tags are spread across multiple pages or labels change over time.
+        
+        Args:
+            target_label: Tag label to search for (e.g., "Politics", "Crypto")
+            page_size: Number of tags per page (default: 200)
+            max_pages: Maximum number of pages to search (default: 50)
+        
+        Returns: Tuple of (tag_id, slug, tag_object) or (None, None, None) if not found
+        """
+        # Normalize target label (strip and lowercase)
+        target_label_normalized = target_label.strip().lower()
+        
+        if not target_label_normalized:
+            self._log("Empty target label provided")
+            return None, None, None
+        
+        self._log(f"Searching for tag with label: '{target_label}' (normalized: '{target_label_normalized}')")
+        
+        # Iterate through pages
+        offset = 0
+        pages_searched = 0
+        for page_num in range(max_pages):
+            pages_searched = page_num + 1
+            # Check cache first
+            cache_key = f"tags_{page_size}_{offset}"
+            
+            # Try to get from cache
+            tags = None
+            if cache_key in self._tags_cache and self._is_cache_valid(cache_key, cache_timestamps=self._tags_cache_timestamps):
+                self._log(f"Using cached tags for page {pages_searched} (offset={offset})")
+                tags = self._tags_cache[cache_key]
+            else:
+                # Fetch tags for this page using get_tags() which handles caching
+                tags = self.get_tags(limit=page_size, offset=offset)
+            
+            # If response is empty list, break (no more pages)
+            if not tags or len(tags) == 0:
+                self._log(f"No more tags found after page {pages_searched}")
+                break
+            
+            # Search through tags in this page
+            for tag in tags:
+                if not isinstance(tag, dict):
+                    continue  # Skip malformed tag data
+                
+                # Get and normalize label
+                tag_label = tag.get('label', '')
+                if not tag_label:
+                    continue  # Skip tags without labels
+                
+                tag_label_normalized = tag_label.strip().lower()
+                
+                # Compare normalized labels (exact match)
+                if tag_label_normalized == target_label_normalized:
+                    tag_id = tag.get('id')
+                    tag_slug = tag.get('slug')
+                    
+                    if tag_id:
+                        self._log(f"✅ Found tag: '{tag_label}' (id: {tag_id}, slug: {tag_slug})")
+                        # Return tag_id as string
+                        return str(tag_id), tag_slug, tag
+                    else:
+                        self._log(f"Found matching tag but missing ID: '{tag_label}'")
+            
+            # Increment offset for next page
+            offset += page_size
+        
+        # Tag not found after searching all pages
+        self._log(f"❌ Tag with label '{target_label}' not found after searching {pages_searched} pages")
+        return None, None, None
+    
+    def get_tag_by_id(self, tag_id: str) -> Optional[Dict]:
+        """
+        Get a specific tag by ID.
+        
+        Args:
+            tag_id: Tag ID
+        
+        Returns: Tag dictionary or None if not found
+        """
+        cache_key = f"tag_id_{tag_id}"
+        
+        if cache_key in self._tags_cache and self._is_cache_valid(cache_key, cache_timestamps=self._tags_cache_timestamps):
+            self._log(f"Using cached tag: {tag_id}")
+            return self._tags_cache[cache_key]
+        
+        url = f"{self.GAMMA_URL}/tags/{tag_id}"
+        data = self._request(url)
+        
+        if data:
+            self._tags_cache[cache_key] = data
+            self._tags_cache_timestamps[cache_key] = datetime.now()
+            
+            # Also cache by slug if available
+            tag_slug = data.get('slug')
+            if tag_slug:
+                slug_cache_key = f"tag_slug_{tag_slug}"
+                self._tags_cache[slug_cache_key] = data
+                self._tags_cache_timestamps[slug_cache_key] = datetime.now()
+            
+            self._log(f"Fetched tag by ID: {tag_id}")
+            return data
+        
+        return None
+    
+    def get_tag_by_slug(self, tag_slug: str) -> Optional[Dict]:
+        """
+        Get a specific tag by slug.
+        
+        Args:
+            tag_slug: Tag slug (e.g., 'crypto', 'politics', 'sports')
+        
+        Returns: Tag dictionary or None if not found
+        """
+        cache_key = f"tag_slug_{tag_slug}"
+        
+        if cache_key in self._tags_cache and self._is_cache_valid(cache_key, cache_timestamps=self._tags_cache_timestamps):
+            self._log(f"Using cached tag: {tag_slug}")
+            return self._tags_cache[cache_key]
+        
+        url = f"{self.GAMMA_URL}/tags/{tag_slug}"
+        data = self._request(url)
+        
+        if data:
+            self._tags_cache[cache_key] = data
+            self._tags_cache_timestamps[cache_key] = datetime.now()
+            
+            # Also cache by ID if available
+            tag_id = data.get('id')
+            if tag_id:
+                id_cache_key = f"tag_id_{tag_id}"
+                self._tags_cache[id_cache_key] = data
+                self._tags_cache_timestamps[id_cache_key] = datetime.now()
+            
+            self._log(f"Fetched tag by slug: {tag_slug}")
+            return data
+        
+        return None
+    
+    def get_related_tags(self, tag_id_or_slug: str, use_id: bool = True) -> List[Dict]:
+        """
+        Get related tags (sub-categories) for a tag.
+        
+        Retrieves tags that are related to the given tag, which represents
+        sub-categories in Polymarket's category hierarchy.
+        
+        Args:
+            tag_id_or_slug: Tag ID or slug
+            use_id: If True, treat tag_id_or_slug as ID; if False, treat as slug
+        
+        Returns: List of related tag dictionaries (sub-categories)
+        """
+        cache_key = f"related_tags_{tag_id_or_slug}"
+        
+        if cache_key in self._tags_cache and self._is_cache_valid(cache_key, cache_timestamps=self._tags_cache_timestamps):
+            self._log(f"Using cached related tags: {tag_id_or_slug}")
+            return self._tags_cache[cache_key]
+        
+        url = f"{self.GAMMA_URL}/tags/{tag_id_or_slug}/related-tags/tags"
+        data = self._request(url)
+        
+        if data:
+            # Handle different response formats
+            tags = []
+            if isinstance(data, list):
+                tags = data
+            elif isinstance(data, dict):
+                tags = data.get('tags', data.get('data', data.get('results', [])))
+            
+            if tags:
+                self._tags_cache[cache_key] = tags
+                self._tags_cache_timestamps[cache_key] = datetime.now()
+                self._log(f"Fetched {len(tags)} related tags for {tag_id_or_slug}")
+                return tags
+        
+        # Return cached data if API fails
+        if cache_key in self._tags_cache:
+            self._log("API failed, using stale cache")
+            return self._tags_cache[cache_key]
+        
+        return []
+    
+    # =========================================================================
     # CLOB API - Orderbook and Trades
     # =========================================================================
     
@@ -267,24 +552,116 @@ class PolymarketFetcher:
             return float(data['price'])
         return None
     
-    def get_trades(self, token_id: str = None, limit: int = 500) -> List[Dict]:
-        """Fetch recent trades"""
-        url = f"{self.CLOB_URL}/trades"
-        params = {'limit': limit}
+    def get_trades(self, token_id: str = None, limit: int = 500, market: str = None, asset_id: str = None, side: str = None) -> List[Dict]:
+        """
+        Fetch recent trades from Polymarket Data API (public market data).
         
-        if token_id:
-            params['asset_id'] = token_id
+        Uses the Data API endpoint which is the recommended source for public market trades tape.
+        This endpoint properly supports filtering by conditionId (market) and asset (token).
         
-        self._log(f"Fetching trades...")
+        Args:
+            token_id: Token ID (asset ID) - alias for asset_id parameter
+            limit: Maximum number of trades to fetch (default: 500, max: 500 for Data API)
+            market: Market/condition ID (REQUIRED - conditionId parameter)
+            asset_id: Asset ID (token ID) - filters trades for specific outcome token (YES/NO)
+            side: Trade side filter - 'BUY' or 'SELL' (optional)
+        
+        Returns: List of trade dictionaries with fields: id, asset_id, conditionId, price, size, side, timestamp, etc.
+        """
+        # Use Data API endpoint (public market data) instead of CLOB API
+        url = f"{self.DATA_URL}/trades"
+        
+        # Determine target asset_id for filtering (from parameter or token_id)
+        target_asset_id = asset_id or token_id
+        
+        # Data API requires conditionId parameter (market/condition ID)
+        if not market:
+            self._log(f"⚠️ No market parameter provided. Cannot fetch trades without conditionId.")
+            self._log(f"   Hint: Provide 'market' parameter (condition ID) to fetch trades")
+            return []
+        
+        # Build parameters for Data API
+        params = {
+            'conditionId': market,  # Data API uses 'conditionId' not 'market'
+            'limit': min(limit, 500)  # Data API max is 500
+        }
+        
+        # Add asset filter if provided (Data API supports this as query parameter)
+        if target_asset_id:
+            params['asset'] = target_asset_id
+            self._log(f"Fetching trades for conditionId={market[:20]}... with asset={target_asset_id[:20]}...")
+        else:
+            self._log(f"Fetching trades for conditionId={market[:20]}... (all outcomes)")
+        
+        # Add side filter if provided
+        if side:
+            params['side'] = side.upper()  # Ensure uppercase
+            self._log(f"Filtering by side: {side}")
+        
+        self._log(f"API Request: {url} with params: {params}")
         
         data = self._request(url, params)
         
-        if data:
-            trades = data if isinstance(data, list) else data.get('trades', [])
-            self._log(f"Fetched {len(trades)} trades")
-            return trades
+        if data is None:
+            self._log("❌ No trades data returned from API")
+            self._log("   Check: 1) Market ID (conditionId) is correct 2) Market has active trading")
+            return []
         
-        return []
+        # Handle different response formats
+        trades = []
+        if isinstance(data, list):
+            # Direct list response - most common format
+            trades = data
+        elif isinstance(data, dict):
+            # Nested response - try common keys
+            trades = data.get('trades', data.get('data', data.get('results', data.get('items', []))))
+            
+            # If still no trades, check if response indicates empty result
+            if not trades:
+                count = data.get('count', data.get('total', data.get('length', None)))
+                if count is not None and count == 0:
+                    self._log(f"API returned empty result (count=0) - market may have no recent trades")
+                    return []
+                elif 'message' in data:
+                    self._log(f"API message: {data.get('message')}")
+                elif 'error' in data:
+                    self._log(f"API error: {data.get('error')}")
+        else:
+            self._log(f"⚠️ Unexpected response format: {type(data)}, value: {str(data)[:100]}")
+            return []
+        
+        # Additional client-side filtering if needed (backup in case API filter didn't work)
+        original_count = len(trades)
+        if target_asset_id and trades:
+            # Double-check filtering (API should have filtered, but verify)
+            filtered_trades = []
+            for trade in trades:
+                # Check multiple possible field names for asset_id
+                trade_asset_id = trade.get('asset') or trade.get('asset_id') or trade.get('assetId') or trade.get('token_id') or trade.get('tokenId')
+                if trade_asset_id == target_asset_id:
+                    filtered_trades.append(trade)
+            
+            if len(filtered_trades) != original_count:
+                self._log(f"Client-side filtered {original_count} trades to {len(filtered_trades)} trades for asset={target_asset_id[:20]}...")
+            trades = filtered_trades
+        
+        if trades:
+            self._log(f"✅ Successfully fetched {len(trades)} trades from Data API")
+            # Log sample trade structure for debugging
+            if self.verbose and trades:
+                sample_trade = trades[0]
+                sample_keys = list(sample_trade.keys())[:10]
+                self._log(f"Sample trade structure: {sample_keys}")
+                if target_asset_id:
+                    sample_asset = sample_trade.get('asset', sample_trade.get('asset_id', sample_trade.get('assetId', 'N/A')))
+                    self._log(f"Sample trade asset: {sample_asset}")
+        else:
+            if original_count == 0:
+                self._log("⚠️ No trades found in API response (market may be inactive or have no recent trades)")
+            else:
+                self._log(f"⚠️ No trades found after filtering (filtered {original_count} trades, none matched asset={target_asset_id[:20] if target_asset_id else 'N/A'})")
+        
+        return trades
     
     def get_last_trade_price(self, token_id: str) -> Optional[float]:
         """Get last trade price for a token"""
@@ -437,7 +814,7 @@ class PolymarketFetcher:
         # Fetch active markets for live price data
         self._log("\n📊 Fetching active markets with high volume...")
         active_markets = self.get_markets(
-            limit=n_markets * 3,  # Fetch more to account for filtering
+            limit=500,  # Fetch 500 markets (max for better training data)
             active=True,
             closed=False,
             order='volume24hr',
@@ -506,7 +883,7 @@ class PolymarketFetcher:
             liquidity = float(market.get('liquidityNum', 0) or market.get('liquidity', 0) or 0)
             
             # Get historical price data
-            price_history = self.get_prices_history(yes_token, interval='1w', fidelity=60)
+            price_history = self.get_prices_history(yes_token, interval='1w', fidelity=5)
             
             # Calculate real momentum and volatility from price history
             if len(price_history) >= 10:
@@ -618,21 +995,104 @@ class PolymarketFetcher:
         return None, None
     
     def trades_to_dataframe(self, trades: List[Dict]) -> pd.DataFrame:
-        """Convert trades to DataFrame"""
+        """
+        Convert trades list to DataFrame with normalized column names.
+        
+        Handles Polymarket API trade format with fields:
+        - price, size, side (BUY/SELL), match_time, asset_id, market, etc.
+        """
         if not trades:
             return pd.DataFrame(columns=['timestamp', 'price', 'size', 'side'])
         
-        df = pd.DataFrame(trades)
-        
-        # Normalize columns
-        if 'price' in df.columns:
-            df['price'] = pd.to_numeric(df['price'], errors='coerce')
-        if 'size' in df.columns:
-            df['size'] = pd.to_numeric(df['size'], errors='coerce')
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-        
-        return df.sort_values('timestamp') if 'timestamp' in df.columns else df
+        try:
+            df = pd.DataFrame(trades)
+            
+            # Normalize timestamp column (API may use 'match_time', 'timestamp', 't', etc.)
+            timestamp_col = None
+            for col in ['match_time', 'timestamp', 't', 'time', 'created_at', 'last_update']:
+                if col in df.columns:
+                    timestamp_col = col
+                    break
+            
+            if timestamp_col:
+                df['timestamp'] = pd.to_datetime(df[timestamp_col], errors='coerce', unit='s')
+                # If conversion fails, try without unit parameter (may be ISO string)
+                if df['timestamp'].isna().all():
+                    df['timestamp'] = pd.to_datetime(df[timestamp_col], errors='coerce')
+            else:
+                # Create timestamp from index or use current time
+                df['timestamp'] = datetime.now()
+                self._log("⚠️ No timestamp column found, using current time")
+            
+            # Normalize price column (handle different field names)
+            price_col = None
+            for col in ['price', 'p', 'trade_price', 'execution_price']:
+                if col in df.columns:
+                    price_col = col
+                    break
+            
+            if price_col and price_col != 'price':
+                df['price'] = df[price_col]
+            
+            if 'price' in df.columns:
+                df['price'] = pd.to_numeric(df['price'], errors='coerce')
+            else:
+                df['price'] = 0.5
+                self._log("⚠️ No price column found, using default 0.5")
+            
+            # Normalize size column (handle different field names)
+            size_col = None
+            for col in ['size', 's', 'quantity', 'amount', 'volume']:
+                if col in df.columns:
+                    size_col = col
+                    break
+            
+            if size_col and size_col != 'size':
+                df['size'] = df[size_col]
+            
+            if 'size' in df.columns:
+                df['size'] = pd.to_numeric(df['size'], errors='coerce')
+            else:
+                df['size'] = 0.0
+                self._log("⚠️ No size column found, using default 0.0")
+            
+            # Normalize side column (BUY/SELL)
+            if 'side' not in df.columns:
+                # Try to infer from other fields
+                for col in ['side', 'type', 'direction']:
+                    if col in df.columns:
+                        df['side'] = df[col]
+                        break
+                else:
+                    df['side'] = 'BUY'  # Default
+                    self._log("⚠️ No side column found, using default 'BUY'")
+            
+            # Sort by timestamp (most recent first)
+            if 'timestamp' in df.columns and not df['timestamp'].isna().all():
+                df = df.sort_values('timestamp', ascending=False).reset_index(drop=True)
+            
+            # Keep only essential columns for prediction model
+            essential_cols = ['timestamp', 'price', 'size']
+            optional_cols = ['side', 'asset_id', 'market']
+            available_cols = [c for c in essential_cols + optional_cols if c in df.columns]
+            df = df[available_cols].copy()
+            
+            # Remove rows with invalid price or size
+            df = df.dropna(subset=['price', 'size'])
+            df = df[(df['price'] > 0) & (df['price'] <= 1) & (df['size'] > 0)]
+            
+            self._log(f"✅ Converted {len(df)} valid trades to DataFrame")
+            return df
+            
+        except Exception as e:
+            self._log(f"❌ Error converting trades to DataFrame: {e}")
+            # Return minimal DataFrame with current price
+            return pd.DataFrame({
+                'timestamp': [datetime.now()],
+                'price': [0.5],
+                'size': [0.0],
+                'side': ['BUY']
+            })
     
     def get_market_summary(self, market: Dict) -> Dict:
         """Get formatted market summary"""
