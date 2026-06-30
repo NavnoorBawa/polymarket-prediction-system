@@ -14,6 +14,8 @@ import json
 from functools import lru_cache
 import numpy as np
 
+from chdb_memory import PolymarketCHDBStore
+
 
 class RateLimiter:
     """Simple rate limiter to avoid API throttling"""
@@ -44,11 +46,18 @@ class PolymarketFetcher:
     GAMMA_URL = "https://gamma-api.polymarket.com"
     DATA_URL = "https://data-api.polymarket.com"
     
-    def __init__(self, verbose: bool = False, cache_ttl: int = 300, 
-                 timeout: int = 30, max_retries: int = 3):
+    def __init__(
+        self,
+        verbose: bool = False,
+        cache_ttl: int = 300,
+        timeout: int = 30,
+        max_retries: int = 3,
+        storage: Optional[PolymarketCHDBStore] = None,
+    ):
         self.verbose = verbose
         self.cache_ttl = cache_ttl
         self.default_timeout = timeout
+        self.storage = storage
         
         # Session with connection pooling and retry adapter (best practice)
         self.session = requests.Session()
@@ -80,6 +89,9 @@ class PolymarketFetcher:
         # Cache
         self._markets_cache: Dict[str, dict] = {}
         self._cache_timestamps: Dict[str, datetime] = {}
+
+        if self.storage:
+            self._log(f"Persistent store active: {self.storage.backend} ({self.storage.db_path})")
     
     def _log(self, message: str):
         if self.verbose:
@@ -161,6 +173,22 @@ class PolymarketFetcher:
         if cache_key in self._markets_cache and self._is_cache_valid(cache_key):
             self._log("Using cached markets")
             return self._markets_cache[cache_key]
+
+        if self.storage:
+            persisted_markets = self.storage.load_markets(
+                cache_key=cache_key,
+                limit=limit,
+                max_age_seconds=self.cache_ttl,
+            )
+            if persisted_markets:
+                self._log(f"Using {len(persisted_markets)} markets from persistent cache")
+                self._markets_cache[cache_key] = persisted_markets
+                self._cache_timestamps[cache_key] = datetime.now()
+                for market in persisted_markets:
+                    market_id = market.get('id') or market.get('conditionId')
+                    if market_id:
+                        self._markets_cache[market_id] = market
+                return persisted_markets
         
         url = f"{self.GAMMA_URL}/markets"
         params = {
@@ -190,12 +218,24 @@ class PolymarketFetcher:
                     self._markets_cache[market_id] = market
             
             self._log(f"Fetched {len(data)} markets")
+            if self.storage:
+                self.storage.save_markets(cache_key, data)
             return data
         
         # Return cached data if API fails
         if cache_key in self._markets_cache:
             self._log("API failed, using stale cache")
             return self._markets_cache[cache_key]
+
+        if self.storage:
+            persisted_markets = self.storage.load_markets(
+                cache_key=cache_key,
+                limit=limit,
+                max_age_seconds=None,
+            )
+            if persisted_markets:
+                self._log("API failed, using stale persistent cache")
+                return persisted_markets
         
         return []
     
@@ -269,6 +309,16 @@ class PolymarketFetcher:
     
     def get_trades(self, token_id: str = None, limit: int = 500) -> List[Dict]:
         """Fetch recent trades"""
+        if token_id and self.storage:
+            cached_trades = self.storage.load_trades(
+                token_id=token_id,
+                limit=limit,
+                max_age_seconds=self.cache_ttl,
+            )
+            if cached_trades:
+                self._log(f"Using {len(cached_trades)} cached trades")
+                return cached_trades
+
         url = f"{self.CLOB_URL}/trades"
         params = {'limit': limit}
         
@@ -282,8 +332,20 @@ class PolymarketFetcher:
         if data:
             trades = data if isinstance(data, list) else data.get('trades', [])
             self._log(f"Fetched {len(trades)} trades")
+            if token_id and trades and self.storage:
+                self.storage.save_trades(token_id, trades)
             return trades
-        
+
+        if token_id and self.storage:
+            stale_trades = self.storage.load_trades(
+                token_id=token_id,
+                limit=limit,
+                max_age_seconds=None,
+            )
+            if stale_trades:
+                self._log(f"API failed, using {len(stale_trades)} stale trades")
+                return stale_trades
+
         return []
     
     def get_last_trade_price(self, token_id: str) -> Optional[float]:
@@ -318,6 +380,17 @@ class PolymarketFetcher:
         
         Returns: DataFrame with columns ['timestamp', 'price']
         """
+        if self.storage:
+            cached_history = self.storage.load_price_history(
+                token_id=token_id,
+                interval_name=interval,
+                fidelity=fidelity,
+                max_age_seconds=self.cache_ttl * 4,
+            )
+            if not cached_history.empty:
+                self._log(f"Using {len(cached_history)} cached price points")
+                return cached_history
+
         url = f"{self.CLOB_URL}/prices-history"
         params = {
             'market': token_id,
@@ -343,10 +416,27 @@ class PolymarketFetcher:
                     df = df.rename(columns={'t': 'timestamp', 'p': 'price'})
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
                 df['price'] = pd.to_numeric(df['price'], errors='coerce')
+                if self.storage:
+                    self.storage.save_price_history(
+                        token_id=token_id,
+                        interval_name=interval,
+                        fidelity=fidelity,
+                        history_df=df,
+                    )
                 self._log(f"Fetched {len(df)} price points")
                 return df.sort_values('timestamp').reset_index(drop=True)
-        
+
         self._log(f"No price history available for token")
+        if self.storage:
+            stale_history = self.storage.load_price_history(
+                token_id=token_id,
+                interval_name=interval,
+                fidelity=fidelity,
+                max_age_seconds=None,
+            )
+            if not stale_history.empty:
+                self._log(f"Using stale history from persistent cache ({len(stale_history)} points)")
+                return stale_history
         return pd.DataFrame(columns=['timestamp', 'price'])
     
     def validate_data_freshness(self, trades_df: pd.DataFrame, max_age_hours: float = 24) -> Dict:
@@ -432,6 +522,15 @@ class PolymarketFetcher:
         self._log("FETCHING REAL TRAINING DATA FROM POLYMARKET API")
         self._log("=" * 60)
         
+        if self.storage:
+            cached_training = self.storage.load_training_samples(
+                limit=n_markets,
+                max_age_seconds=24 * 3600,
+            )
+            if len(cached_training) >= n_markets:
+                self._log(f"Loaded {len(cached_training)} training samples from persistent memory")
+                return cached_training[:n_markets]
+
         training_data = []
         
         # Fetch active markets for live price data
@@ -455,7 +554,9 @@ class PolymarketFetcher:
         
         # Note: Closed markets return 404 from CLOB API - cannot use them
         # Training uses price history-based labels instead
-        
+        if self.storage and training_data:
+            self.storage.save_training_samples(training_data, source="api")
+
         self._log(f"\n✅ Total training samples: {len(training_data)}")
         return training_data
     

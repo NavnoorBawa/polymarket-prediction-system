@@ -13,6 +13,7 @@ This project uses sophisticated ML algorithms including XGBoost, LightGBM, and s
 - **Quantitative Metrics**: RSI, volatility, order book imbalance, expected value calculations
 - **Risk Management**: Kelly criterion position sizing and terminal risk adjustments
 - **Smart Filtering**: Automatically excludes resolved and low-volume markets
+- **Persistent Memory Layer**: Stores markets, price history, training samples, model runs, and predictions in a local DB (chDB when available)
 
 ## Components
 
@@ -58,6 +59,21 @@ The system provides:
 - Trading signals (STRONG BUY, BUY, HOLD)
 - Key insights (RSI, volatility, order book pressure)
 - Kelly-optimized position sizes
+
+## Persistent Storage
+
+The app now keeps a local persistent memory database under `data/`:
+
+- `market_snapshots` - fetched market lists
+- `trade_snapshots` - recent trade batches per token
+- `price_history_points` - cached historical price points
+- `training_samples` - prepared training feature vectors/labels
+- `model_training_runs` - training metrics and run metadata
+- `prediction_runs` - generated predictions for traceability
+
+Backend selection:
+- **chDB** is used automatically when available
+- **SQLite** fallback is used on platforms where chDB wheels are unavailable (e.g., Windows)
 
 ## Requirements
 

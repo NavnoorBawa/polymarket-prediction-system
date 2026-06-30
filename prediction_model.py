@@ -18,6 +18,8 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
+from chdb_memory import PolymarketCHDBStore
+
 # Core ML imports
 from sklearn.preprocessing import RobustScaler, StandardScaler
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
@@ -769,14 +771,21 @@ class PolymarketPredictor:
     - XGBoost/LightGBM/Stacking with probability calibration
     """
     
-    def __init__(self, use_optuna: bool = False, use_calibration: bool = True,
-                 kelly_fraction: float = 0.25, bankroll: float = 10000):
+    def __init__(
+        self,
+        use_optuna: bool = False,
+        use_calibration: bool = True,
+        kelly_fraction: float = 0.25,
+        bankroll: float = 10000,
+        storage: Optional[PolymarketCHDBStore] = None,
+    ):
         self.feature_extractor = MarketFeatureExtractor()
         self.scaler = RobustScaler()
         self.use_optuna = use_optuna and HAS_OPTUNA
         self.use_calibration = use_calibration
         self.kelly_fraction = kelly_fraction
         self.bankroll = bankroll
+        self.storage = storage
         
         # Initialize quant strategy components
         self.order_book = OrderBookMicrostructure()
@@ -1030,6 +1039,18 @@ class PolymarketPredictor:
         }
         
         self.is_trained = True
+
+        if self.storage:
+            self.storage.save_model_training_run(
+                metrics=self.training_metrics,
+                sample_count=len(training_data),
+                params={
+                    'use_optuna': self.use_optuna,
+                    'use_calibration': self.use_calibration,
+                    'kelly_fraction': self.kelly_fraction,
+                    'bankroll': self.bankroll,
+                },
+            )
         
         print(f"\n✅ Training Complete!")
         print(f"   Direction Accuracy: {direction_accuracy:.1%}")
@@ -1093,7 +1114,9 @@ class PolymarketPredictor:
         features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=0.0)
         
         if not self.is_trained:
-            return self._heuristic_prediction(trade_features, days_remaining)
+            heuristic = self._heuristic_prediction(trade_features, days_remaining)
+            self._persist_prediction(market, heuristic)
+            return heuristic
         
         features_scaled = self.scaler.transform(features)
         
@@ -1308,7 +1331,7 @@ class PolymarketPredictor:
         else:
             growth_rate = 0.0
         
-        return {
+        prediction = {
             'current_price': current_price,
             'predicted_price': predicted_price,
             'direction': 'UP' if price_change > 0 else 'DOWN',
@@ -1339,6 +1362,12 @@ class PolymarketPredictor:
             'top_features': feature_importance,
             'calibration_quality': self.calibration_info.get('calibration_error', 0),
         }
+        self._persist_prediction(market, prediction)
+        return prediction
+
+    def _persist_prediction(self, market: Dict, prediction: Dict):
+        if self.storage:
+            self.storage.save_prediction(market, prediction)
     
     def _heuristic_prediction(self, trade_features: Dict, 
                                days_remaining: Optional[float] = None) -> Dict:
@@ -1413,8 +1442,17 @@ class PolymarketPredictor:
         print("🌐 FETCHING REAL DATA FROM POLYMARKET API")
         print("   No synthetic data - 100% real market data")
         print("=" * 60)
+
+        if self.storage:
+            cached_samples = self.storage.load_training_samples(
+                limit=n_markets,
+                max_age_seconds=24 * 3600,
+            )
+            if len(cached_samples) >= n_markets:
+                print(f"\n💾 Loaded {len(cached_samples)} training samples from persistent memory")
+                return cached_samples[:n_markets]
         
-        fetcher = PolymarketFetcher(verbose=True)
+        fetcher = PolymarketFetcher(verbose=True, storage=self.storage)
         
         # Fetch real training data using the new API methods
         training_data = fetcher.fetch_real_training_data(
@@ -1424,6 +1462,9 @@ class PolymarketPredictor:
         )
         
         print(f"\n✅ Fetched {len(training_data)} real training samples")
+
+        if self.storage and training_data:
+            self.storage.save_training_samples(training_data, source="api")
         
         # Return training data directly - no feature conversion needed
         # Training uses 10 features from polymarket_fetcher, prediction uses same 10
@@ -1479,7 +1520,9 @@ class PolymarketPredictor:
 def create_predictor(use_optuna: bool = False, 
                      kelly_fraction: float = 0.25,
                      bankroll: float = 10000,
-                     n_markets: int = 100) -> PolymarketPredictor:
+                     n_markets: int = 100,
+                     storage_dir: str = "data",
+                     prefer_chdb: bool = True) -> PolymarketPredictor:
     """
     Factory function to create a configured professional quant predictor.
     
@@ -1496,13 +1539,19 @@ def create_predictor(use_optuna: bool = False,
     predictor = PolymarketPredictor(
         use_optuna=use_optuna,
         kelly_fraction=kelly_fraction,
-        bankroll=bankroll
+        bankroll=bankroll,
+        storage=PolymarketCHDBStore(
+            db_dir=storage_dir,
+            prefer_chdb=prefer_chdb,
+            verbose=True
+        ),
     )
     
     print("\n" + "=" * 70)
     print("🚀 POLYMARKET PREDICTOR - REAL DATA MODE")
     print("   Training on actual Polymarket market data (no synthetic data)")
     print("=" * 70)
+    print(f"💾 Persistent store: {predictor.storage.backend} ({predictor.storage.db_path})")
     
     # Fetch REAL training data from Polymarket API
     training_data = predictor.fetch_real_training_data(n_markets=n_markets)

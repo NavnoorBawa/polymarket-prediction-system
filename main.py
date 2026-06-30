@@ -10,6 +10,7 @@ warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
 
 import json
 import time
+import sys
 from datetime import datetime
 from typing import List, Dict
 
@@ -18,6 +19,13 @@ import numpy as np
 
 from polymarket_fetcher import PolymarketFetcher
 from prediction_model import PolymarketPredictor, create_predictor
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except (ValueError, OSError):
+        pass
 
 
 def print_header():
@@ -163,8 +171,8 @@ def run_single_analysis(num_markets=10):
     
     print_header()
     
-    fetcher = PolymarketFetcher(verbose=False)
     predictor = create_predictor(use_optuna=False)
+    fetcher = PolymarketFetcher(verbose=False, storage=predictor.storage)
     
     print(f"\n📡 Fetching top {num_markets} markets by volume...")
     markets = fetcher.get_markets(limit=num_markets * 5, order='volume24hr')  # Fetch 5x to account for filtering

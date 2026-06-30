@@ -17,6 +17,7 @@ shap>=0.44.0
 # API & Web
 requests>=2.31.0
 websocket-client>=1.6.0
+chdb>=4.1.0; python_version < "3.14" and platform_system != "Windows"
 
 # Visualization (optional)
 matplotlib>=3.7.0
