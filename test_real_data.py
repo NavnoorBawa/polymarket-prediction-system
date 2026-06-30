@@ -3,7 +3,16 @@ Test script for REAL DATA fetching from Polymarket API.
 NO SYNTHETIC DATA - 100% real market data.
 """
 
+import sys
+
 from polymarket_fetcher import PolymarketFetcher
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except (ValueError, OSError):
+        pass
 
 def main():
     print("=" * 70)

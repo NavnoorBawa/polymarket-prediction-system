@@ -11,7 +11,9 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 import time
 import json
+import re
 from functools import lru_cache
+from collections import defaultdict
 import numpy as np
 
 from chdb_memory import PolymarketCHDBStore
@@ -494,7 +496,91 @@ class PolymarketFetcher:
                 'spread': float(data.get('spread', 0))
             }
         return {'bid': 0, 'ask': 0, 'spread': 0}
-    
+
+    def infer_market_domain(self, market: Dict) -> str:
+        """Infer a high-level domain to avoid sports-only sampling."""
+        text_fields = [
+            str(market.get('category', '') or ''),
+            str(market.get('subcategory', '') or ''),
+            str(market.get('groupItemTitle', '') or ''),
+            str(market.get('slug', '') or ''),
+            str(market.get('description', '') or ''),
+            str(market.get('question', '') or ''),
+        ]
+        text = " ".join(text_fields).lower()
+        tokens = set(re.findall(r"[a-z0-9]+", text))
+
+        keyword_map = {
+            'politics': ['election', 'president', 'senate', 'house', 'vote', 'policy', 'government'],
+            'crypto': ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'token', 'solana', 'doge'],
+            'macro': ['fed', 'inflation', 'cpi', 'rates', 'recession', 'gdp', 'treasury'],
+            'tech': ['ai', 'openai', 'apple', 'microsoft', 'google', 'tesla', 'nvidia'],
+            'entertainment': ['movie', 'oscar', 'grammy', 'tv', 'celebrity', 'album'],
+            'science': ['space', 'nasa', 'rocket', 'climate', 'weather', 'hurricane'],
+            'sports': ['world cup', 'fifa', 'nba', 'nfl', 'mlb', 'tennis', 'championship', 'match'],
+        }
+
+        for domain, keywords in keyword_map.items():
+            if any(
+                (keyword in text if " " in keyword else keyword in tokens)
+                for keyword in keywords
+            ):
+                return domain
+
+        category = str(market.get('category', '') or '').strip().lower()
+        if category:
+            return category.replace(" ", "_")
+
+        return 'other'
+
+    def select_diverse_active_markets(
+        self,
+        markets: List[Dict],
+        limit: int,
+        min_volume: float = 1000,
+    ) -> List[Dict]:
+        """Select active markets with domain diversity and volume priority."""
+        domain_buckets: Dict[str, List[Dict]] = defaultdict(list)
+
+        for market in markets:
+            volume = float(market.get('volume24hr', 0) or 0)
+            if volume <= min_volume:
+                continue
+
+            prices_str = market.get('outcomePrices', '[0.5, 0.5]')
+            try:
+                prices = json.loads(prices_str) if isinstance(prices_str, str) else prices_str
+                price = float(prices[0]) if prices else 0.5
+            except (TypeError, ValueError, json.JSONDecodeError):
+                price = 0.5
+
+            if price >= 0.95 or price <= 0.05:
+                continue
+
+            domain = self.infer_market_domain(market)
+            domain_buckets[domain].append(market)
+
+        for domain in domain_buckets:
+            domain_buckets[domain].sort(
+                key=lambda market_item: float(market_item.get('volume24hr', 0) or 0),
+                reverse=True,
+            )
+
+        selected: List[Dict] = []
+        domains = sorted(domain_buckets.keys(), key=lambda d: len(domain_buckets[d]), reverse=True)
+
+        while len(selected) < limit and domains:
+            next_domains = []
+            for domain in domains:
+                bucket = domain_buckets[domain]
+                if bucket and len(selected) < limit:
+                    selected.append(bucket.pop(0))
+                if bucket:
+                    next_domains.append(domain)
+            domains = next_domains
+
+        return selected
+     
     # =========================================================================
     # Real Training Data Methods (NO SYNTHETIC DATA)
     # =========================================================================
@@ -528,15 +614,31 @@ class PolymarketFetcher:
                 max_age_seconds=24 * 3600,
             )
             if len(cached_training) >= n_markets:
-                self._log(f"Loaded {len(cached_training)} training samples from persistent memory")
-                return cached_training[:n_markets]
+                cached_domains = {
+                    self.infer_market_domain({'question': sample.get('question', '')})
+                    for sample in cached_training
+                }
+                timestamp_coverage = (
+                    sum(1 for sample in cached_training if sample.get('sample_timestamp')) / len(cached_training)
+                )
+                if len(cached_domains) >= 3 and timestamp_coverage >= 0.70:
+                    self._log(
+                        f"Loaded {len(cached_training)} training samples from persistent memory "
+                        f"across {len(cached_domains)} domains "
+                        f"(timestamps {timestamp_coverage:.0%})"
+                    )
+                    return cached_training[:n_markets]
+                self._log(
+                    "Persistent training cache is not suitable (low domain diversity or timestamp coverage); "
+                    "refreshing from API"
+                )
 
         training_data = []
         
         # Fetch active markets for live price data
         self._log("\n📊 Fetching active markets with high volume...")
         active_markets = self.get_markets(
-            limit=n_markets * 3,  # Fetch more to account for filtering
+            limit=max(n_markets * 8, 300),  # Fetch more to diversify beyond sports
             active=True,
             closed=False,
             order='volume24hr',
@@ -544,8 +646,15 @@ class PolymarketFetcher:
         )
         
         self._log(f"Found {len(active_markets)} active markets")
-        
-        for market in active_markets:
+
+        candidate_markets = self.select_diverse_active_markets(
+            markets=active_markets,
+            limit=n_markets * 3,
+            min_volume=min_volume,
+        )
+        self._log(f"Selected {len(candidate_markets)} diverse market candidates")
+
+        for market in candidate_markets:
             sample = self._process_market_for_training(market, is_closed=False)
             if sample:
                 training_data.append(sample)
@@ -608,31 +717,56 @@ class PolymarketFetcher:
             
             # Get historical price data
             price_history = self.get_prices_history(yes_token, interval='1w', fidelity=60)
-            
-            # Calculate real momentum and volatility from price history
-            if len(price_history) >= 10:
-                prices_arr = price_history['price'].values
-                momentum = (prices_arr[-1] - prices_arr[0]) / max(prices_arr[0], 0.01)
-                volatility = np.std(np.diff(prices_arr)) if len(prices_arr) > 1 else 0.02
-                
-                # RSI-like calculation
-                changes = np.diff(prices_arr)
-                gains = np.mean(changes[changes > 0]) if len(changes[changes > 0]) > 0 else 0
-                losses = -np.mean(changes[changes < 0]) if len(changes[changes < 0]) > 0 else 0
+
+            sample_timestamp = int(time.time())
+            one_day_change = 0.0
+            one_week_change = 0.0
+            domain = self.infer_market_domain(market)
+            prices_arr = pd.to_numeric(price_history['price'], errors='coerce').dropna().values
+            time_arr = pd.to_datetime(price_history['timestamp'], errors='coerce')
+
+            if len(prices_arr) >= 30:
+                # Prevent data leakage: build features only from the historical "past" slice
+                # and define labels on the future slice.
+                split_idx = int(len(prices_arr) * 0.7)
+                split_idx = max(split_idx, 12)
+                split_idx = min(split_idx, len(prices_arr) - 3)
+
+                past_prices = prices_arr[:split_idx]
+                future_prices = prices_arr[split_idx:]
+
+                changes = np.diff(past_prices)
+                momentum = (past_prices[-1] - past_prices[0]) / max(past_prices[0], 0.01)
+                volatility = np.std(changes) if len(changes) > 0 else 0.02
+
+                gains = np.mean(changes[changes > 0]) if np.any(changes > 0) else 0
+                losses = -np.mean(changes[changes < 0]) if np.any(changes < 0) else 0
                 if losses > 0:
                     rs = gains / losses
                     rsi = 1 - (1 / (1 + rs))
                 else:
                     rsi = 0.5
+
+                day_window = min(24, len(past_prices) - 1)
+                week_window = min(7 * 24, len(past_prices) - 1)
+
+                if day_window > 0:
+                    anchor_price = past_prices[-(day_window + 1)]
+                    one_day_change = (past_prices[-1] - anchor_price) / max(anchor_price, 0.01)
+                if week_window > 0:
+                    anchor_price = past_prices[-(week_window + 1)]
+                    one_week_change = (past_prices[-1] - anchor_price) / max(anchor_price, 0.01)
+
+                training_price = float(np.clip(past_prices[-1], 0.01, 0.99))
+                forecast_horizon = min(5, len(future_prices))
+                future_price = float(np.clip(np.mean(future_prices[:forecast_horizon]), 0.01, 0.99))
+                outcome = 1 if future_price > training_price else 0
+
+                if len(time_arr) > split_idx - 1 and pd.notna(time_arr.iloc[split_idx - 1]):
+                    sample_timestamp = int(time_arr.iloc[split_idx - 1].timestamp())
             else:
-                # Fallback if no price history
-                momentum = 0.0
-                volatility = 0.02
-                rsi = 0.5
-            
-            # Price change metrics
-            one_day_change = float(market.get('oneDayPriceChange', 0) or 0)
-            one_week_change = float(market.get('oneWeekPriceChange', 0) or 0)
+                # Avoid low-quality labels when historical depth is too short.
+                return None
             
             # Get spread
             best_bid = float(market.get('bestBid', 0) or 0)
@@ -641,30 +775,8 @@ class PolymarketFetcher:
             
             # Skip markets at very extreme prices (>99% or <1%) - these are effectively resolved
             # No trading opportunity exists at these prices
-            if current_price > 0.99 or current_price < 0.01:
+            if training_price > 0.99 or training_price < 0.01:
                 return None
-            
-            # Determine outcome using PRICE HISTORY (not just current price)
-            # This creates better training labels based on actual price movement
-            if len(price_history) >= 20:
-                prices_arr = price_history['price'].values
-                # Use first half as "past" features, last price as "outcome"
-                mid_point = len(prices_arr) // 2
-                past_avg = np.mean(prices_arr[:mid_point])
-                recent_avg = np.mean(prices_arr[-5:])  # Last 5 points
-                
-                # Outcome: did price go UP (1) or DOWN (0)?
-                outcome = 1 if recent_avg > past_avg else 0
-                future_price = recent_avg
-                
-                # Use the mid-point price as "current" for training
-                # This simulates having past data and predicting future
-                training_price = prices_arr[mid_point]
-            else:
-                # Fallback: use momentum direction
-                outcome = 1 if momentum > 0 else 0
-                future_price = current_price
-                training_price = current_price
             
             # Build feature vector (same order as FeatureExtractor)
             features = np.array([
@@ -689,6 +801,8 @@ class PolymarketFetcher:
                 'question': market.get('question', 'Unknown')[:50],
                 'is_resolved': is_closed,
                 'volume': volume_total,
+                'domain': domain,
+                'sample_timestamp': sample_timestamp,
             }
             
         except Exception as e:

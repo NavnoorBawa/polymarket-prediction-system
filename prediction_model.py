@@ -14,6 +14,7 @@ Features:
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
+from collections import Counter
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
@@ -23,7 +24,15 @@ from chdb_memory import PolymarketCHDBStore
 # Core ML imports
 from sklearn.preprocessing import RobustScaler, StandardScaler
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
-from sklearn.metrics import accuracy_score, mean_squared_error, f1_score, log_loss, brier_score_loss
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    mean_squared_error,
+    f1_score,
+    log_loss,
+    brier_score_loss,
+    roc_auc_score,
+)
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.linear_model import LogisticRegression, Ridge, ElasticNet
 from sklearn.ensemble import (
@@ -54,6 +63,12 @@ try:
 except ImportError:
     HAS_LIGHTGBM = False
     print("LightGBM not installed. Install with: pip install lightgbm")
+
+try:
+    from catboost import CatBoostClassifier, CatBoostRegressor
+    HAS_CATBOOST = True
+except ImportError:
+    HAS_CATBOOST = False
 
 try:
     import optuna
@@ -793,6 +808,13 @@ class PolymarketPredictor:
         self.risk_manager = TerminalRiskManager()
         self.bayesian = BayesianAggregator()
         self.kelly = KellyCriterion()
+        self.base_model_names: List[str] = []
+        self.model_manifest: Dict[str, object] = {}
+        self.latest_training_domain_counts: Dict[str, int] = {}
+        self.latest_training_class_counts: Dict[str, int] = {}
+        self.class_balance_params: Dict[str, float] = {}
+        self.last_training_started_at: Optional[str] = None
+        self.last_training_completed_at: Optional[str] = None
         
         self._build_models()
         self.is_trained = False
@@ -803,6 +825,7 @@ class PolymarketPredictor:
     def _build_models(self):
         base_classifiers = []
         base_regressors = []
+        self.base_model_names = []
         
         if HAS_XGBOOST:
             # Enhanced XGBoost with best practices for probability estimation
@@ -828,6 +851,7 @@ class PolymarketPredictor:
             )
             base_classifiers.append(('xgb', xgb_clf))
             base_regressors.append(('xgb', xgb_reg))
+            self.base_model_names.append('xgboost')
         
         if HAS_LIGHTGBM:
             # Enhanced LightGBM with best practices
@@ -851,6 +875,34 @@ class PolymarketPredictor:
             )
             base_classifiers.append(('lgb', lgb_clf))
             base_regressors.append(('lgb', lgb_reg))
+            self.base_model_names.append('lightgbm')
+
+        if HAS_CATBOOST:
+            cb_clf = CatBoostClassifier(
+                iterations=250,
+                depth=6,
+                learning_rate=0.03,
+                loss_function='Logloss',
+                eval_metric='Logloss',
+                auto_class_weights='Balanced',
+                random_seed=42,
+                allow_writing_files=False,
+                thread_count=-1,
+                verbose=False,
+            )
+            cb_reg = CatBoostRegressor(
+                iterations=250,
+                depth=6,
+                learning_rate=0.03,
+                loss_function='RMSE',
+                random_seed=42,
+                allow_writing_files=False,
+                thread_count=-1,
+                verbose=False,
+            )
+            base_classifiers.append(('catboost', cb_clf))
+            base_regressors.append(('catboost', cb_reg))
+            self.base_model_names.append('catboost')
         
         hgb_clf = HistGradientBoostingClassifier(
             max_iter=200, max_depth=5, learning_rate=0.03,
@@ -866,16 +918,19 @@ class PolymarketPredictor:
         )
         base_classifiers.append(('hgb', hgb_clf))
         base_regressors.append(('hgb', hgb_reg))
+        self.base_model_names.append('hist_gradient_boosting')
         
         et_clf = ExtraTreesClassifier(n_estimators=150, max_depth=8, min_samples_split=5, random_state=42, n_jobs=-1)
         et_reg = ExtraTreesRegressor(n_estimators=150, max_depth=8, min_samples_split=5, random_state=42, n_jobs=-1)
         base_classifiers.append(('et', et_clf))
         base_regressors.append(('et', et_reg))
+        self.base_model_names.append('extra_trees')
         
         rf_clf = RandomForestClassifier(n_estimators=150, max_depth=6, min_samples_split=5, random_state=42, n_jobs=-1)
         rf_reg = RandomForestRegressor(n_estimators=150, max_depth=6, min_samples_split=5, random_state=42, n_jobs=-1)
         base_classifiers.append(('rf', rf_clf))
         base_regressors.append(('rf', rf_reg))
+        self.base_model_names.append('random_forest')
         
         # Stacking ensemble - adaptive CV based on expected data size
         self._raw_direction_model = StackingClassifier(
@@ -902,16 +957,69 @@ class PolymarketPredictor:
             cv=3, n_jobs=-1  # Reduced from 5
         )
         
-        self.confidence_model = LogisticRegression(C=0.5, max_iter=1000, random_state=42)
+        self.confidence_model = LogisticRegression(
+            C=0.5,
+            max_iter=1000,
+            class_weight='balanced',
+            random_state=42,
+        )
+        self.model_manifest = {
+            'base_models': list(self.base_model_names),
+            'use_calibration': self.use_calibration,
+            'has_xgboost': HAS_XGBOOST,
+            'has_lightgbm': HAS_LIGHTGBM,
+            'has_catboost': HAS_CATBOOST,
+            'stacking_cv': 3,
+        }
         
         print(f"✓ Built ensemble with {len(base_classifiers)} base models")
         if HAS_XGBOOST:
             print("  - XGBoost (enhanced with early stopping params)")
         if HAS_LIGHTGBM:
             print("  - LightGBM (enhanced with num_leaves)")
+        if HAS_CATBOOST:
+            print("  - CatBoost (ordered boosting)")
         print("  - HistGradientBoosting, ExtraTrees, RandomForest")
         if self.use_calibration:
             print("  - Probability Calibration: sigmoid (CalibratedClassifierCV)")
+
+    def _configure_class_imbalance(self, y_direction: np.ndarray):
+        """Configure all ensemble classifiers with class-balance aware settings."""
+        negatives = float(np.sum(y_direction == 0))
+        positives = float(np.sum(y_direction == 1))
+
+        if negatives <= 0 or positives <= 0:
+            self.class_balance_params = {}
+            return
+
+        total = negatives + positives
+        weight_0 = total / (2.0 * negatives)
+        weight_1 = total / (2.0 * positives)
+        scale_pos_weight = negatives / positives
+
+        params = {
+            'final_estimator__class_weight': 'balanced',
+            'et__class_weight': 'balanced_subsample',
+            'rf__class_weight': 'balanced_subsample',
+        }
+        if HAS_XGBOOST:
+            params['xgb__scale_pos_weight'] = float(scale_pos_weight)
+        if HAS_LIGHTGBM:
+            params['lgb__class_weight'] = {0: float(weight_0), 1: float(weight_1)}
+
+        self._raw_direction_model.set_params(**params)
+        self.class_balance_params = {
+            'negative_count': float(negatives),
+            'positive_count': float(positives),
+            'class_weight_0': float(weight_0),
+            'class_weight_1': float(weight_1),
+            'scale_pos_weight': float(scale_pos_weight),
+        }
+        print(
+            "  ⚖️  Class balancing enabled: "
+            f"w0={weight_0:.3f}, w1={weight_1:.3f}, "
+            f"scale_pos_weight={scale_pos_weight:.3f}"
+        )
     
     def train(self, training_data: List[Dict]) -> Dict:
         if len(training_data) < 10:
@@ -920,12 +1028,22 @@ class PolymarketPredictor:
             return {'status': 'insufficient_data', 'direction_accuracy': 0.80}
         
         print(f"\n🚀 Training on {len(training_data)} samples...")
+        train_started_at = datetime.utcnow()
+        self.last_training_started_at = train_started_at.isoformat()
         
         X = np.vstack([d['features'] for d in training_data])
         y_price = np.array([d['future_price'] for d in training_data])
+        sample_timestamps = np.array([float(d.get('sample_timestamp', 0) or 0) for d in training_data])
+        domain_counter = Counter(
+            str(d.get('domain', 'other') or 'other')
+            for d in training_data
+        )
+        self.latest_training_domain_counts = dict(domain_counter)
         
         # Use outcome directly (resolved markets have real outcomes)
         y_direction = np.array([d['outcome'] for d in training_data])
+        class_counter = Counter(int(x) for x in y_direction.tolist())
+        self.latest_training_class_counts = {str(label): int(count) for label, count in class_counter.items()}
         
         # Check class balance and log it
         class_ratio = np.mean(y_direction)
@@ -950,27 +1068,53 @@ class PolymarketPredictor:
             
             class_ratio = np.mean(y_direction)
             print(f"  📊 Adjusted class balance: {class_ratio:.1%} positive, {1-class_ratio:.1%} negative")
-        
+
+        unique_classes = np.unique(y_direction)
+        self._configure_class_imbalance(y_direction)
+
         X = np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=0.0)
         X_scaled = self.scaler.fit_transform(X)
-        
-        # Use stratified split only if we have both classes
+
+        # Prefer time-based split when timestamps are available; fallback to random split.
+        split_strategy = "random"
         unique_classes = np.unique(y_direction)
-        if len(unique_classes) >= 2:
-            X_train, X_val, y_dir_train, y_dir_val = train_test_split(
-                X_scaled, y_direction, test_size=0.2, random_state=42, stratify=y_direction
-            )
-            _, _, y_price_train, y_price_val = train_test_split(
-                X_scaled, y_price, test_size=0.2, random_state=42
-            )
-        else:
-            # No stratification if only one class
-            X_train, X_val, y_dir_train, y_dir_val = train_test_split(
-                X_scaled, y_direction, test_size=0.2, random_state=42
-            )
-            _, _, y_price_train, y_price_val = train_test_split(
-                X_scaled, y_price, test_size=0.2, random_state=42
-            )
+        valid_time_mask = sample_timestamps > 0
+        has_temporal_index = valid_time_mask.sum() >= max(20, int(len(training_data) * 0.6))
+
+        if has_temporal_index:
+            sorted_idx = np.argsort(sample_timestamps)
+            split_idx = max(int(len(sorted_idx) * 0.8), 1)
+            train_idx = sorted_idx[:split_idx]
+            val_idx = sorted_idx[split_idx:]
+
+            if (
+                len(val_idx) >= 5
+                and len(np.unique(y_direction[train_idx])) >= 2
+                and len(np.unique(y_direction[val_idx])) >= 2
+            ):
+                X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
+                y_dir_train, y_dir_val = y_direction[train_idx], y_direction[val_idx]
+                y_price_train, y_price_val = y_price[train_idx], y_price[val_idx]
+                split_strategy = "time_based"
+            else:
+                has_temporal_index = False
+
+        if not has_temporal_index:
+            if len(unique_classes) >= 2:
+                X_train, X_val, y_dir_train, y_dir_val = train_test_split(
+                    X_scaled, y_direction, test_size=0.2, random_state=42, stratify=y_direction
+                )
+                _, _, y_price_train, y_price_val = train_test_split(
+                    X_scaled, y_price, test_size=0.2, random_state=42
+                )
+            else:
+                # No stratification if only one class
+                X_train, X_val, y_dir_train, y_dir_val = train_test_split(
+                    X_scaled, y_direction, test_size=0.2, random_state=42
+                )
+                _, _, y_price_train, y_price_val = train_test_split(
+                    X_scaled, y_price, test_size=0.2, random_state=42
+                )
         
         print("  📈 Training direction model (stacking ensemble with calibration)...")
         self.direction_model.fit(X_train, y_dir_train)
@@ -987,7 +1131,14 @@ class PolymarketPredictor:
         val_proba = self.direction_model.predict_proba(X_val)[:, 1]
         
         direction_accuracy = accuracy_score(y_dir_val, val_pred)
+        direction_balanced_accuracy = balanced_accuracy_score(y_dir_val, val_pred)
         f1 = f1_score(y_dir_val, val_pred)
+        auc = roc_auc_score(y_dir_val, val_proba) if len(np.unique(y_dir_val)) >= 2 else 0.5
+        baseline_pred = (X_val[:, 0] >= 0.5).astype(int)
+        baseline_accuracy = accuracy_score(y_dir_val, baseline_pred)
+        baseline_balanced_accuracy = balanced_accuracy_score(y_dir_val, baseline_pred)
+        lift_vs_baseline = direction_accuracy - baseline_accuracy
+        balanced_lift_vs_baseline = direction_balanced_accuracy - baseline_balanced_accuracy
         
         # Probability quality metrics (key for prediction markets!)
         brier = brier_score_loss(y_dir_val, val_proba)  # Lower is better
@@ -1009,12 +1160,50 @@ class PolymarketPredictor:
         
         price_pred = self.price_model.predict(X_val)
         price_rmse = np.sqrt(mean_squared_error(y_price_val, price_pred))
-        
-        cv_scores = cross_val_score(
-            self.direction_model, X_scaled, y_direction, 
-            cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
-            scoring='accuracy'
-        )
+
+        # Evaluate high-confidence predictions to verify real predictive signal.
+        high_conf_mask = np.abs(val_proba - 0.5) >= 0.10
+        if np.any(high_conf_mask):
+            high_conf_accuracy = accuracy_score(y_dir_val[high_conf_mask], val_pred[high_conf_mask])
+            high_conf_balanced_accuracy = balanced_accuracy_score(
+                y_dir_val[high_conf_mask],
+                val_pred[high_conf_mask],
+            )
+            high_conf_coverage = float(np.mean(high_conf_mask))
+        else:
+            high_conf_accuracy = direction_accuracy
+            high_conf_balanced_accuracy = direction_balanced_accuracy
+            high_conf_coverage = 0.0
+
+        class_counts = np.bincount(y_direction.astype(int), minlength=2)
+        valid_counts = class_counts[class_counts > 0]
+        min_class_count = int(valid_counts.min()) if len(valid_counts) > 0 else 0
+        cv_splits = max(2, min(5, min_class_count))
+
+        if len(unique_classes) >= 2 and min_class_count >= 2:
+            cv_accuracy_scores = cross_val_score(
+                self.direction_model, X_scaled, y_direction,
+                cv=StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42),
+                scoring='accuracy'
+            )
+            cv_balanced_scores = cross_val_score(
+                self.direction_model, X_scaled, y_direction,
+                cv=StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42),
+                scoring='balanced_accuracy'
+            )
+        else:
+            cv_accuracy_scores = np.array([direction_accuracy])
+            cv_balanced_scores = np.array([direction_balanced_accuracy])
+
+        required_lift = 0.01 if split_strategy == "time_based" else 0.005
+        required_high_conf_balanced = max(baseline_balanced_accuracy + 0.01, 0.52)
+        predictive_checks = {
+            'lift_vs_baseline': balanced_lift_vs_baseline >= required_lift,
+            'brier_quality': brier <= 0.25,
+            'auc_quality': auc >= 0.60,
+            'high_conf_quality': high_conf_balanced_accuracy >= required_high_conf_balanced,
+        }
+        has_predictive_signal = all(predictive_checks.values())
         
         # Initialize SHAP explainer if available
         if HAS_SHAP and hasattr(self, '_raw_direction_model'):
@@ -1027,15 +1216,42 @@ class PolymarketPredictor:
             except:
                 pass
         
+        train_finished_at = datetime.utcnow()
+        self.last_training_completed_at = train_finished_at.isoformat()
+        training_duration_seconds = (train_finished_at - train_started_at).total_seconds()
+
         self.training_metrics = {
             'direction_accuracy': direction_accuracy,
+            'direction_balanced_accuracy': direction_balanced_accuracy,
+            'baseline_accuracy': baseline_accuracy,
+            'baseline_balanced_accuracy': baseline_balanced_accuracy,
+            'lift_vs_baseline': lift_vs_baseline,
+            'balanced_lift_vs_baseline': balanced_lift_vs_baseline,
             'f1_score': f1,
+            'auc': auc,
             'brier_score': brier,  # NEW: Lower is better, perfect = 0
             'log_loss': logloss,  # NEW: Lower is better
             'calibration_error': calibration_error,  # NEW: How well calibrated
             'price_rmse': price_rmse,
-            'cv_accuracy_mean': cv_scores.mean(),
-            'cv_accuracy_std': cv_scores.std(),
+            'cv_accuracy_mean': cv_accuracy_scores.mean(),
+            'cv_accuracy_std': cv_accuracy_scores.std(),
+            'cv_balanced_accuracy_mean': cv_balanced_scores.mean(),
+            'cv_balanced_accuracy_std': cv_balanced_scores.std(),
+            'high_conf_accuracy': high_conf_accuracy,
+            'high_conf_balanced_accuracy': high_conf_balanced_accuracy,
+            'high_conf_coverage': high_conf_coverage,
+            'split_strategy': split_strategy,
+            'has_predictive_signal': has_predictive_signal,
+            'predictive_checks': predictive_checks,
+            'required_lift': required_lift,
+            'required_high_conf_balanced': required_high_conf_balanced,
+            'class_balance': self.class_balance_params,
+            'training_duration_seconds': training_duration_seconds,
+            'train_started_at': self.last_training_started_at,
+            'train_completed_at': self.last_training_completed_at,
+            'training_domain_counts': self.latest_training_domain_counts,
+            'training_class_counts': self.latest_training_class_counts,
+            'model_manifest': self.model_manifest,
         }
         
         self.is_trained = True
@@ -1049,17 +1265,36 @@ class PolymarketPredictor:
                     'use_calibration': self.use_calibration,
                     'kelly_fraction': self.kelly_fraction,
                     'bankroll': self.bankroll,
+                    'base_models': self.base_model_names,
                 },
             )
         
         print(f"\n✅ Training Complete!")
+        print(f"   Split Strategy: {split_strategy}")
         print(f"   Direction Accuracy: {direction_accuracy:.1%}")
+        print(f"   Balanced Accuracy: {direction_balanced_accuracy:.1%}")
+        print(f"   Baseline Accuracy: {baseline_accuracy:.1%}")
+        print(f"   Baseline Balanced Accuracy: {baseline_balanced_accuracy:.1%}")
+        print(f"   Lift vs Baseline: {lift_vs_baseline:+.1%}")
+        print(f"   Balanced Lift vs Baseline: {balanced_lift_vs_baseline:+.1%}")
         print(f"   F1 Score: {f1:.2f}")
+        print(f"   ROC-AUC: {auc:.3f}")
         print(f"   Brier Score: {brier:.4f} (lower=better, perfect=0)")
         print(f"   Log Loss: {logloss:.4f} (lower=better)")
         print(f"   Calibration Error: {calibration_error:.4f}")
+        print(f"   High-Conf Hit Rate: {high_conf_accuracy:.1%} (coverage {high_conf_coverage:.1%})")
+        print(f"   High-Conf Balanced Hit Rate: {high_conf_balanced_accuracy:.1%}")
         print(f"   Price RMSE: {price_rmse:.4f}")
-        print(f"   Cross-Val Accuracy: {cv_scores.mean():.1%} (±{cv_scores.std():.1%})")
+        print(
+            f"   Cross-Val Accuracy: {cv_accuracy_scores.mean():.1%} "
+            f"(±{cv_accuracy_scores.std():.1%})"
+        )
+        print(
+            f"   Cross-Val Balanced Accuracy: {cv_balanced_scores.mean():.1%} "
+            f"(±{cv_balanced_scores.std():.1%})"
+        )
+        print(f"   Training Duration: {training_duration_seconds:.1f}s")
+        print(f"   Predictive Signal Verified: {'YES' if has_predictive_signal else 'NO'}")
         
         return self.training_metrics
     
@@ -1077,6 +1312,55 @@ class PolymarketPredictor:
             return importance
         except:
             return {}
+
+    @staticmethod
+    def _build_trend_profile(
+        price_change: float,
+        confidence: float,
+        current_price: float,
+        order_book_imbalance: float,
+    ) -> Dict[str, object]:
+        """Build trend-scoring output independent from trade execution guardrails."""
+        abs_change = abs(float(price_change))
+        extremeness = min(float(current_price), 1 - float(current_price))
+
+        # Lower thresholds for extreme prices where small absolute moves matter.
+        if extremeness < 0.15:
+            strong_thr, moderate_thr, weak_thr = 0.020, 0.010, 0.004
+        else:
+            strong_thr, moderate_thr, weak_thr = 0.040, 0.020, 0.008
+
+        if abs_change >= strong_thr and confidence >= 0.58:
+            trend_label = "STRONG"
+        elif abs_change >= moderate_thr and confidence >= 0.54:
+            trend_label = "MODERATE"
+        elif abs_change >= weak_thr and confidence >= 0.50:
+            trend_label = "WEAK"
+        else:
+            trend_label = "FLAT"
+
+        trend_direction = "UP" if price_change > 0 else "DOWN"
+        move_component = min(abs_change / max(moderate_thr, 1e-6), 1.5) / 1.5
+        confidence_component = float(np.clip((confidence - 0.50) / 0.35, 0.0, 1.0))
+        order_flow_component = min(abs(float(order_book_imbalance)) / 0.40, 1.0)
+
+        trend_score = float(
+            np.clip(
+                (0.55 * move_component + 0.30 * confidence_component + 0.15 * order_flow_component) * 100.0,
+                0.0,
+                100.0,
+            )
+        )
+
+        trend_signal = f"{trend_label}_{trend_direction}" if trend_label != "FLAT" else "FLAT"
+        trend_interesting = trend_label in {"STRONG", "MODERATE"} or trend_score >= 35.0
+        return {
+            'trend_signal': trend_signal,
+            'trend_label': trend_label,
+            'trend_direction': trend_direction,
+            'trend_score': trend_score,
+            'trend_interesting': trend_interesting,
+        }
     
     def predict(self, market: Dict, trades_df: pd.DataFrame, 
                 days_remaining: Optional[float] = None) -> Dict:
@@ -1313,6 +1597,24 @@ class PolymarketPredictor:
             signal = "WEAK"
         else:
             signal = "HOLD"
+
+        # Reliability guard: if validation does not confirm predictive edge,
+        # only allow actions on very strong/high-confidence dislocations.
+        predictive_signal_verified = bool(self.training_metrics.get('has_predictive_signal', True))
+        if not predictive_signal_verified:
+            if abs(price_change) < 0.08 or confidence < 0.60:
+                action = 'HOLD'
+                signal = 'HOLD'
+                adjusted_position = 0.0
+            else:
+                adjusted_position *= 0.5
+
+        trend_profile = self._build_trend_profile(
+            price_change=price_change,
+            confidence=confidence,
+            current_price=current_price,
+            order_book_imbalance=obi,
+        )
         
         # Get feature importance if available
         feature_importance = self.get_feature_importance(features_scaled)
@@ -1361,6 +1663,8 @@ class PolymarketPredictor:
             'order_imbalance': trade_features['order_imbalance'],
             'top_features': feature_importance,
             'calibration_quality': self.calibration_info.get('calibration_error', 0),
+            'predictive_signal_verified': predictive_signal_verified,
+            **trend_profile,
         }
         self._persist_prediction(market, prediction)
         return prediction
@@ -1395,6 +1699,13 @@ class PolymarketPredictor:
         
         if days_remaining is None:
             days_remaining = 30
+
+        trend_profile = self._build_trend_profile(
+            price_change=predicted_change,
+            confidence=confidence,
+            current_price=current_price,
+            order_book_imbalance=order_imbalance,
+        )
         
         return {
             'current_price': current_price,
@@ -1423,6 +1734,8 @@ class PolymarketPredictor:
             'order_imbalance': order_imbalance,
             'top_features': {},
             'calibration_quality': 0.0,
+            'predictive_signal_verified': False,
+            **trend_profile,
         }
     
     def fetch_real_training_data(self, n_markets: int = 100) -> List[Dict]:
@@ -1443,16 +1756,29 @@ class PolymarketPredictor:
         print("   No synthetic data - 100% real market data")
         print("=" * 60)
 
+        fetcher = PolymarketFetcher(verbose=True, storage=self.storage)
+
         if self.storage:
             cached_samples = self.storage.load_training_samples(
                 limit=n_markets,
                 max_age_seconds=24 * 3600,
             )
             if len(cached_samples) >= n_markets:
-                print(f"\n💾 Loaded {len(cached_samples)} training samples from persistent memory")
-                return cached_samples[:n_markets]
-        
-        fetcher = PolymarketFetcher(verbose=True, storage=self.storage)
+                cached_domains = {
+                    fetcher.infer_market_domain({'question': sample.get('question', '')})
+                    for sample in cached_samples
+                }
+                timestamp_coverage = (
+                    sum(1 for sample in cached_samples if sample.get('sample_timestamp')) / len(cached_samples)
+                )
+                if len(cached_domains) >= 3 and timestamp_coverage >= 0.70:
+                    print(
+                        f"\n💾 Loaded {len(cached_samples)} training samples from persistent memory "
+                        f"across {len(cached_domains)} domains "
+                        f"(timestamps {timestamp_coverage:.0%})"
+                    )
+                    return cached_samples[:n_markets]
+                print("\n⚠️  Cached training data is not suitable; refreshing from API")
         
         # Fetch real training data using the new API methods
         training_data = fetcher.fetch_real_training_data(

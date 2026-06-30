@@ -235,6 +235,18 @@ class PolymarketCHDBStore:
             """
         )
 
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS run_reports (
+                report_id String,
+                created_epoch Int64,
+                run_type String,
+                report_json String
+            ) ENGINE = MergeTree
+            ORDER BY (created_epoch, report_id)
+            """
+        )
+
     def _init_sqlite_schema(self):
         self._execute(
             """
@@ -341,6 +353,21 @@ class PolymarketCHDBStore:
         self._execute(
             "CREATE INDEX IF NOT EXISTS idx_prediction_runs_epoch "
             "ON prediction_runs (created_epoch)"
+        )
+
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS run_reports (
+                report_id TEXT NOT NULL,
+                created_epoch INTEGER NOT NULL,
+                run_type TEXT NOT NULL,
+                report_json TEXT NOT NULL
+            )
+            """
+        )
+        self._execute(
+            "CREATE INDEX IF NOT EXISTS idx_run_reports_epoch "
+            "ON run_reports (created_epoch)"
         )
 
     def _latest_epoch(
@@ -594,7 +621,7 @@ class PolymarketCHDBStore:
 
         safe_limit = max(int(limit), 1)
         sql = (
-            "SELECT market_id, question, current_price, future_price, outcome, volume, features_json "
+            "SELECT market_id, question, current_price, future_price, outcome, volume, features_json, raw_json "
             "FROM training_samples "
             f"WHERE {where_sql} ORDER BY created_epoch DESC LIMIT {safe_limit}"
         )
@@ -607,22 +634,31 @@ class PolymarketCHDBStore:
             except json.JSONDecodeError:
                 continue
 
+            try:
+                raw_payload = json.loads(row[7]) if row[7] else {}
+            except json.JSONDecodeError:
+                raw_payload = {}
+
             if not isinstance(feature_values, list) or not feature_values:
                 continue
 
             features_array = np.array(feature_values, dtype=float).reshape(1, -1)
-            samples.append(
-                {
-                    "features": features_array,
-                    "current_price": self._to_float(row[2], 0.5),
-                    "future_price": self._to_float(row[3], 0.5),
-                    "outcome": int(row[4]),
-                    "market_id": row[0] or "unknown",
-                    "question": row[1] or "Unknown",
-                    "is_resolved": False,
-                    "volume": self._to_float(row[5], 0.0),
-                }
-            )
+            sample = {
+                "features": features_array,
+                "current_price": self._to_float(row[2], 0.5),
+                "future_price": self._to_float(row[3], 0.5),
+                "outcome": int(row[4]),
+                "market_id": row[0] or "unknown",
+                "question": row[1] or "Unknown",
+                "is_resolved": False,
+                "volume": self._to_float(row[5], 0.0),
+            }
+            if "sample_timestamp" in raw_payload:
+                sample["sample_timestamp"] = raw_payload.get("sample_timestamp")
+            if "domain" in raw_payload:
+                sample["domain"] = raw_payload.get("domain")
+
+            samples.append(sample)
 
         return samples
 
@@ -699,3 +735,42 @@ class PolymarketCHDBStore:
                 )
             ],
         )
+
+    def save_run_report(self, report: Dict, run_type: str = "live_prediction"):
+        if not report:
+            return
+
+        created_epoch = int(time.time())
+        report_seed = f"{created_epoch}|{run_type}|{json.dumps(report, sort_keys=True, default=str)}"
+        report_id = hashlib.sha1(report_seed.encode("utf-8")).hexdigest()
+
+        self._insert_rows(
+            "run_reports",
+            ("report_id", "created_epoch", "run_type", "report_json"),
+            [
+                (
+                    report_id,
+                    created_epoch,
+                    run_type,
+                    json.dumps(report, default=str, separators=(",", ":")),
+                )
+            ],
+        )
+
+    def load_latest_run_report(self, run_type: Optional[str] = None) -> Optional[Dict]:
+        where_sql = "1 = 1"
+        if run_type:
+            where_sql = f"run_type = {self._sql_literal(run_type)}"
+
+        sql = (
+            "SELECT report_json FROM run_reports "
+            f"WHERE {where_sql} ORDER BY created_epoch DESC LIMIT 1"
+        )
+        rows = self._query(sql)
+        if not rows:
+            return None
+
+        try:
+            return json.loads(rows[0][0])
+        except json.JSONDecodeError:
+            return None
