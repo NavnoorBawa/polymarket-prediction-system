@@ -589,31 +589,45 @@ class PolymarketFetcher:
         self,
         n_markets: int = 50,
         min_volume: float = 1000,
-        include_closed: bool = False  # Disabled - CLOB returns 404 for closed markets
+        include_closed: bool = False,  # Disabled - CLOB returns 404 for closed markets
+        train_pool_size: Optional[int] = None,
+        force_refresh: bool = True,
     ) -> List[Dict]:
         """
-        Fetch REAL training data from Polymarket for ML model training.
-        
+        Fetch REAL training data from Polymarket and accumulate it in the DB.
+
         NO SYNTHETIC DATA - uses actual historical prices and outcomes.
         Uses price history to create training labels (price direction over time).
-        
+
+        Accumulation model:
+          1. Harvest up to `n_markets` FRESH samples from the API each call.
+          2. Persist them with dedup so the DB pool grows over time.
+          3. Return up to `train_pool_size` distinct accumulated samples for training
+             (defaults to the larger of n_markets and the whole pool).
+
         Args:
-            n_markets: Number of markets to fetch
-            min_volume: Minimum 24h volume filter
-            include_closed: Disabled - closed markets have no CLOB data
-        
-        Returns: List of training samples with real features and outcomes
+            n_markets: Number of FRESH markets to harvest this call.
+            min_volume: Minimum 24h volume filter.
+            include_closed: Disabled - closed markets have no CLOB data.
+            train_pool_size: Max distinct accumulated samples to return for training.
+            force_refresh: When True, always hit the API to grow the pool. When False,
+                a sufficiently large/diverse recent cache short-circuits the fetch.
+
+        Returns: List of training samples (the accumulated pool, deduped).
         """
         self._log("=" * 60)
         self._log("FETCHING REAL TRAINING DATA FROM POLYMARKET API")
         self._log("=" * 60)
-        
-        if self.storage:
+
+        pool_target = max(int(train_pool_size) if train_pool_size else n_markets, n_markets)
+
+        # Optional fast path: only when refresh is NOT forced and we already have a rich cache.
+        if self.storage and not force_refresh:
             cached_training = self.storage.load_training_samples(
-                limit=n_markets,
+                limit=pool_target,
                 max_age_seconds=24 * 3600,
             )
-            if len(cached_training) >= n_markets:
+            if len(cached_training) >= pool_target:
                 cached_domains = {
                     self.infer_market_domain({'question': sample.get('question', '')})
                     for sample in cached_training
@@ -627,14 +641,10 @@ class PolymarketFetcher:
                         f"across {len(cached_domains)} domains "
                         f"(timestamps {timestamp_coverage:.0%})"
                     )
-                    return cached_training[:n_markets]
-                self._log(
-                    "Persistent training cache is not suitable (low domain diversity or timestamp coverage); "
-                    "refreshing from API"
-                )
+                    return cached_training
 
         training_data = []
-        
+
         # Fetch active markets for live price data
         self._log("\n📊 Fetching active markets with high volume...")
         active_markets = self.get_markets(
@@ -644,7 +654,7 @@ class PolymarketFetcher:
             order='volume24hr',
             ascending=False
         )
-        
+
         self._log(f"Found {len(active_markets)} active markets")
 
         candidate_markets = self.select_diverse_active_markets(
@@ -660,11 +670,23 @@ class PolymarketFetcher:
                 training_data.append(sample)
             if len(training_data) >= n_markets:
                 break
-        
-        # Note: Closed markets return 404 from CLOB API - cannot use them
-        # Training uses price history-based labels instead
+
+        # Persist freshly harvested samples (dedup happens inside save_training_samples).
+        inserted = 0
         if self.storage and training_data:
-            self.storage.save_training_samples(training_data, source="api")
+            inserted = self.storage.save_training_samples(training_data, source="api")
+            total_pool = self.storage.count_training_samples()
+            self._log(
+                f"Harvested {len(training_data)} fresh samples "
+                f"({inserted} new) -> accumulated pool now {total_pool} distinct samples"
+            )
+
+        # Build the training pool from the accumulated, deduped history.
+        if self.storage:
+            pool = self.storage.load_training_samples(limit=pool_target)
+            if pool:
+                self._log(f"\n✅ Training pool: {len(pool)} accumulated samples (fresh this run: {len(training_data)})")
+                return pool
 
         self._log(f"\n✅ Total training samples: {len(training_data)}")
         return training_data

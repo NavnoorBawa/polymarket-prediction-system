@@ -545,12 +545,48 @@ class PolymarketCHDBStore:
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
         return df.dropna(subset=["price"]).reset_index(drop=True)
 
-    def save_training_samples(self, samples: List[Dict], source: str = "api"):
+    def _existing_training_sample_ids(self, sample_ids: Sequence[str]) -> set:
+        """Return the subset of sample_ids already stored (for dedup on save)."""
+        unique_ids = [sid for sid in {s for s in sample_ids if s}]
+        if not unique_ids:
+            return set()
+
+        existing: set = set()
+        # Query in chunks to avoid oversized IN clauses.
+        chunk_size = 400
+        for start in range(0, len(unique_ids), chunk_size):
+            chunk = unique_ids[start:start + chunk_size]
+            in_list = ", ".join(self._sql_literal(sid) for sid in chunk)
+            sql = f"SELECT sample_id FROM training_samples WHERE sample_id IN ({in_list})"
+            try:
+                rows = self._query(sql)
+            except Exception:
+                rows = []
+            for row in rows:
+                existing.add(row[0])
+        return existing
+
+    def count_training_samples(self, max_age_seconds: Optional[int] = None) -> int:
+        """Count distinct accumulated training samples (optionally within a time window)."""
+        where_sql = "1 = 1"
+        if max_age_seconds is not None:
+            threshold = int(time.time()) - int(max_age_seconds)
+            where_sql = f"created_epoch >= {threshold}"
+        sql = f"SELECT count(DISTINCT sample_id) FROM training_samples WHERE {where_sql}"
+        try:
+            rows = self._query(sql)
+            return int(rows[0][0]) if rows and rows[0] and rows[0][0] is not None else 0
+        except Exception:
+            return 0
+
+    def save_training_samples(self, samples: List[Dict], source: str = "api") -> int:
+        """Persist training samples, skipping ones already stored. Returns count inserted."""
         if not samples:
-            return
+            return 0
 
         created_epoch = int(time.time())
         rows = []
+        candidate_ids = []
         for sample in samples:
             features = sample.get("features")
             if isinstance(features, np.ndarray):
@@ -575,6 +611,7 @@ class PolymarketCHDBStore:
             raw_json = json.dumps(sample, default=str, separators=(",", ":"))
             features_json = json.dumps(feature_list, separators=(",", ":"))
 
+            candidate_ids.append(sample_id)
             rows.append(
                 (
                     sample_id,
@@ -591,6 +628,21 @@ class PolymarketCHDBStore:
                 )
             )
 
+        # Deduplicate: drop rows whose sample_id is already stored or repeated in this batch.
+        existing_ids = self._existing_training_sample_ids(candidate_ids)
+        seen_in_batch: set = set()
+        new_rows = []
+        for row in rows:
+            sample_id = row[0]
+            if sample_id in existing_ids or sample_id in seen_in_batch:
+                continue
+            seen_in_batch.add(sample_id)
+            new_rows.append(row)
+
+        if not new_rows:
+            self._log("No new training samples to store (all duplicates)")
+            return 0
+
         self._insert_rows(
             "training_samples",
             (
@@ -606,13 +658,16 @@ class PolymarketCHDBStore:
                 "features_json",
                 "raw_json",
             ),
-            rows,
+            new_rows,
         )
+        self._log(f"Stored {len(new_rows)} new training samples (skipped {len(rows) - len(new_rows)} duplicates)")
+        return len(new_rows)
 
     def load_training_samples(
         self,
         limit: int = 100,
         max_age_seconds: Optional[int] = None,
+        dedupe: bool = True,
     ) -> List[Dict]:
         where_sql = "1 = 1"
         if max_age_seconds is not None:
@@ -620,15 +675,24 @@ class PolymarketCHDBStore:
             where_sql = f"created_epoch >= {threshold}"
 
         safe_limit = max(int(limit), 1)
+        # Over-fetch when deduping so we can still return up to `limit` distinct rows.
+        fetch_limit = safe_limit * 3 if dedupe else safe_limit
         sql = (
-            "SELECT market_id, question, current_price, future_price, outcome, volume, features_json, raw_json "
+            "SELECT market_id, question, current_price, future_price, outcome, volume, features_json, raw_json, sample_id "
             "FROM training_samples "
-            f"WHERE {where_sql} ORDER BY created_epoch DESC LIMIT {safe_limit}"
+            f"WHERE {where_sql} ORDER BY created_epoch DESC LIMIT {fetch_limit}"
         )
         rows = self._query(sql)
 
         samples = []
+        seen_ids: set = set()
         for row in rows:
+            sample_id = row[8] if len(row) > 8 else None
+            if dedupe and sample_id is not None:
+                if sample_id in seen_ids:
+                    continue
+                seen_ids.add(sample_id)
+
             try:
                 feature_values = json.loads(row[6])
             except json.JSONDecodeError:
@@ -659,6 +723,8 @@ class PolymarketCHDBStore:
                 sample["domain"] = raw_payload.get("domain")
 
             samples.append(sample)
+            if len(samples) >= safe_limit:
+                break
 
         return samples
 

@@ -1738,19 +1738,32 @@ class PolymarketPredictor:
             **trend_profile,
         }
     
-    def fetch_real_training_data(self, n_markets: int = 100) -> List[Dict]:
+    def fetch_real_training_data(
+        self,
+        n_markets: int = 100,
+        train_pool_size: Optional[int] = None,
+        force_refresh: bool = True,
+    ) -> List[Dict]:
         """
-        Fetch REAL training data from Polymarket API.
-        
+        Fetch REAL training data from Polymarket API and accumulate it in the DB.
+
         NO SYNTHETIC DATA - only real market data is used.
-        
+
+        Each call harvests up to `n_markets` fresh samples, dedups them into the
+        persistent pool, and returns up to `train_pool_size` accumulated samples
+        for training (so the model trains on the full growing history).
+
         Args:
-            n_markets: Number of markets to fetch data from
-        
-        Returns: List of training samples with real features and outcomes
+            n_markets: Number of fresh markets to harvest from the API this call.
+            train_pool_size: Max accumulated samples to return for training.
+            force_refresh: When True always hit the API to grow the pool.
+
+        Returns: List of accumulated training samples (deduped).
         """
         from polymarket_fetcher import PolymarketFetcher
-        
+
+        pool_target = max(int(train_pool_size) if train_pool_size else n_markets, n_markets)
+
         print("\n" + "=" * 60)
         print("🌐 FETCHING REAL DATA FROM POLYMARKET API")
         print("   No synthetic data - 100% real market data")
@@ -1759,39 +1772,21 @@ class PolymarketPredictor:
         fetcher = PolymarketFetcher(verbose=True, storage=self.storage)
 
         if self.storage:
-            cached_samples = self.storage.load_training_samples(
-                limit=n_markets,
-                max_age_seconds=24 * 3600,
-            )
-            if len(cached_samples) >= n_markets:
-                cached_domains = {
-                    fetcher.infer_market_domain({'question': sample.get('question', '')})
-                    for sample in cached_samples
-                }
-                timestamp_coverage = (
-                    sum(1 for sample in cached_samples if sample.get('sample_timestamp')) / len(cached_samples)
-                )
-                if len(cached_domains) >= 3 and timestamp_coverage >= 0.70:
-                    print(
-                        f"\n💾 Loaded {len(cached_samples)} training samples from persistent memory "
-                        f"across {len(cached_domains)} domains "
-                        f"(timestamps {timestamp_coverage:.0%})"
-                    )
-                    return cached_samples[:n_markets]
-                print("\n⚠️  Cached training data is not suitable; refreshing from API")
-        
-        # Fetch real training data using the new API methods
+            pool_before = self.storage.count_training_samples()
+            print(f"\n💾 Accumulated training pool before run: {pool_before} distinct samples")
+
+        # Delegate to the fetcher which harvests fresh data, dedups into the DB,
+        # and returns the accumulated pool for training.
         training_data = fetcher.fetch_real_training_data(
             n_markets=n_markets,
             min_volume=1000,
-            include_closed=True
+            include_closed=True,
+            train_pool_size=pool_target,
+            force_refresh=force_refresh,
         )
-        
-        print(f"\n✅ Fetched {len(training_data)} real training samples")
 
-        if self.storage and training_data:
-            self.storage.save_training_samples(training_data, source="api")
-        
+        print(f"\n✅ Training pool ready: {len(training_data)} accumulated samples")
+
         # Return training data directly - no feature conversion needed
         # Training uses 10 features from polymarket_fetcher, prediction uses same 10
         return training_data
@@ -1847,6 +1842,7 @@ def create_predictor(use_optuna: bool = False,
                      kelly_fraction: float = 0.25,
                      bankroll: float = 10000,
                      n_markets: int = 100,
+                     train_pool_size: Optional[int] = None,
                      storage_dir: str = "data",
                      prefer_chdb: bool = True) -> PolymarketPredictor:
     """
@@ -1859,9 +1855,15 @@ def create_predictor(use_optuna: bool = False,
         kelly_fraction: Fraction of full Kelly (0.25 = quarter Kelly, industry standard)
         bankroll: Total trading capital
         n_markets: Number of real markets to fetch for training
+        train_pool_size: Max accumulated samples to train on (defaults to a large pool)
     
     Returns: Trained PolymarketPredictor with all quant strategies initialized
     """
+    # Default the training pool to a large accumulated window so the model
+    # trains on the full growing history, not just this run's fresh harvest.
+    if train_pool_size is None:
+        train_pool_size = max(n_markets * 10, 500)
+
     predictor = PolymarketPredictor(
         use_optuna=use_optuna,
         kelly_fraction=kelly_fraction,
@@ -1880,14 +1882,18 @@ def create_predictor(use_optuna: bool = False,
     print(f"💾 Persistent store: {predictor.storage.backend} ({predictor.storage.db_path})")
     
     # Fetch REAL training data from Polymarket API
-    training_data = predictor.fetch_real_training_data(n_markets=n_markets)
+    training_data = predictor.fetch_real_training_data(
+        n_markets=n_markets, train_pool_size=train_pool_size
+    )
     
     if len(training_data) < 10:
         print("\n⚠️  Warning: Low training data count. API may be rate limiting.")
         print("   Waiting 5 seconds and retrying...")
         import time
         time.sleep(5)
-        training_data = predictor.fetch_real_training_data(n_markets=n_markets)
+        training_data = predictor.fetch_real_training_data(
+            n_markets=n_markets, train_pool_size=train_pool_size
+        )
     
     print(f"\n📊 Training model on {len(training_data)} REAL market samples")
     predictor.train(training_data)
