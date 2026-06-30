@@ -11,8 +11,12 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 import time
 import json
+import re
 from functools import lru_cache
+from collections import defaultdict
 import numpy as np
+
+from chdb_memory import PolymarketCHDBStore
 
 
 class RateLimiter:
@@ -44,11 +48,18 @@ class PolymarketFetcher:
     GAMMA_URL = "https://gamma-api.polymarket.com"
     DATA_URL = "https://data-api.polymarket.com"
     
-    def __init__(self, verbose: bool = False, cache_ttl: int = 300, 
-                 timeout: int = 30, max_retries: int = 3):
+    def __init__(
+        self,
+        verbose: bool = False,
+        cache_ttl: int = 300,
+        timeout: int = 30,
+        max_retries: int = 3,
+        storage: Optional[PolymarketCHDBStore] = None,
+    ):
         self.verbose = verbose
         self.cache_ttl = cache_ttl
         self.default_timeout = timeout
+        self.storage = storage
         
         # Session with connection pooling and retry adapter (best practice)
         self.session = requests.Session()
@@ -80,6 +91,9 @@ class PolymarketFetcher:
         # Cache
         self._markets_cache: Dict[str, dict] = {}
         self._cache_timestamps: Dict[str, datetime] = {}
+
+        if self.storage:
+            self._log(f"Persistent store active: {self.storage.backend} ({self.storage.db_path})")
     
     def _log(self, message: str):
         if self.verbose:
@@ -161,6 +175,22 @@ class PolymarketFetcher:
         if cache_key in self._markets_cache and self._is_cache_valid(cache_key):
             self._log("Using cached markets")
             return self._markets_cache[cache_key]
+
+        if self.storage:
+            persisted_markets = self.storage.load_markets(
+                cache_key=cache_key,
+                limit=limit,
+                max_age_seconds=self.cache_ttl,
+            )
+            if persisted_markets:
+                self._log(f"Using {len(persisted_markets)} markets from persistent cache")
+                self._markets_cache[cache_key] = persisted_markets
+                self._cache_timestamps[cache_key] = datetime.now()
+                for market in persisted_markets:
+                    market_id = market.get('id') or market.get('conditionId')
+                    if market_id:
+                        self._markets_cache[market_id] = market
+                return persisted_markets
         
         url = f"{self.GAMMA_URL}/markets"
         params = {
@@ -190,12 +220,24 @@ class PolymarketFetcher:
                     self._markets_cache[market_id] = market
             
             self._log(f"Fetched {len(data)} markets")
+            if self.storage:
+                self.storage.save_markets(cache_key, data)
             return data
         
         # Return cached data if API fails
         if cache_key in self._markets_cache:
             self._log("API failed, using stale cache")
             return self._markets_cache[cache_key]
+
+        if self.storage:
+            persisted_markets = self.storage.load_markets(
+                cache_key=cache_key,
+                limit=limit,
+                max_age_seconds=None,
+            )
+            if persisted_markets:
+                self._log("API failed, using stale persistent cache")
+                return persisted_markets
         
         return []
     
@@ -269,6 +311,16 @@ class PolymarketFetcher:
     
     def get_trades(self, token_id: str = None, limit: int = 500) -> List[Dict]:
         """Fetch recent trades"""
+        if token_id and self.storage:
+            cached_trades = self.storage.load_trades(
+                token_id=token_id,
+                limit=limit,
+                max_age_seconds=self.cache_ttl,
+            )
+            if cached_trades:
+                self._log(f"Using {len(cached_trades)} cached trades")
+                return cached_trades
+
         url = f"{self.CLOB_URL}/trades"
         params = {'limit': limit}
         
@@ -282,8 +334,20 @@ class PolymarketFetcher:
         if data:
             trades = data if isinstance(data, list) else data.get('trades', [])
             self._log(f"Fetched {len(trades)} trades")
+            if token_id and trades and self.storage:
+                self.storage.save_trades(token_id, trades)
             return trades
-        
+
+        if token_id and self.storage:
+            stale_trades = self.storage.load_trades(
+                token_id=token_id,
+                limit=limit,
+                max_age_seconds=None,
+            )
+            if stale_trades:
+                self._log(f"API failed, using {len(stale_trades)} stale trades")
+                return stale_trades
+
         return []
     
     def get_last_trade_price(self, token_id: str) -> Optional[float]:
@@ -318,6 +382,17 @@ class PolymarketFetcher:
         
         Returns: DataFrame with columns ['timestamp', 'price']
         """
+        if self.storage:
+            cached_history = self.storage.load_price_history(
+                token_id=token_id,
+                interval_name=interval,
+                fidelity=fidelity,
+                max_age_seconds=self.cache_ttl * 4,
+            )
+            if not cached_history.empty:
+                self._log(f"Using {len(cached_history)} cached price points")
+                return cached_history
+
         url = f"{self.CLOB_URL}/prices-history"
         params = {
             'market': token_id,
@@ -343,10 +418,27 @@ class PolymarketFetcher:
                     df = df.rename(columns={'t': 'timestamp', 'p': 'price'})
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
                 df['price'] = pd.to_numeric(df['price'], errors='coerce')
+                if self.storage:
+                    self.storage.save_price_history(
+                        token_id=token_id,
+                        interval_name=interval,
+                        fidelity=fidelity,
+                        history_df=df,
+                    )
                 self._log(f"Fetched {len(df)} price points")
                 return df.sort_values('timestamp').reset_index(drop=True)
-        
+
         self._log(f"No price history available for token")
+        if self.storage:
+            stale_history = self.storage.load_price_history(
+                token_id=token_id,
+                interval_name=interval,
+                fidelity=fidelity,
+                max_age_seconds=None,
+            )
+            if not stale_history.empty:
+                self._log(f"Using stale history from persistent cache ({len(stale_history)} points)")
+                return stale_history
         return pd.DataFrame(columns=['timestamp', 'price'])
     
     def validate_data_freshness(self, trades_df: pd.DataFrame, max_age_hours: float = 24) -> Dict:
@@ -404,7 +496,91 @@ class PolymarketFetcher:
                 'spread': float(data.get('spread', 0))
             }
         return {'bid': 0, 'ask': 0, 'spread': 0}
-    
+
+    def infer_market_domain(self, market: Dict) -> str:
+        """Infer a high-level domain to avoid sports-only sampling."""
+        text_fields = [
+            str(market.get('category', '') or ''),
+            str(market.get('subcategory', '') or ''),
+            str(market.get('groupItemTitle', '') or ''),
+            str(market.get('slug', '') or ''),
+            str(market.get('description', '') or ''),
+            str(market.get('question', '') or ''),
+        ]
+        text = " ".join(text_fields).lower()
+        tokens = set(re.findall(r"[a-z0-9]+", text))
+
+        keyword_map = {
+            'politics': ['election', 'president', 'senate', 'house', 'vote', 'policy', 'government'],
+            'crypto': ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'token', 'solana', 'doge'],
+            'macro': ['fed', 'inflation', 'cpi', 'rates', 'recession', 'gdp', 'treasury'],
+            'tech': ['ai', 'openai', 'apple', 'microsoft', 'google', 'tesla', 'nvidia'],
+            'entertainment': ['movie', 'oscar', 'grammy', 'tv', 'celebrity', 'album'],
+            'science': ['space', 'nasa', 'rocket', 'climate', 'weather', 'hurricane'],
+            'sports': ['world cup', 'fifa', 'nba', 'nfl', 'mlb', 'tennis', 'championship', 'match'],
+        }
+
+        for domain, keywords in keyword_map.items():
+            if any(
+                (keyword in text if " " in keyword else keyword in tokens)
+                for keyword in keywords
+            ):
+                return domain
+
+        category = str(market.get('category', '') or '').strip().lower()
+        if category:
+            return category.replace(" ", "_")
+
+        return 'other'
+
+    def select_diverse_active_markets(
+        self,
+        markets: List[Dict],
+        limit: int,
+        min_volume: float = 1000,
+    ) -> List[Dict]:
+        """Select active markets with domain diversity and volume priority."""
+        domain_buckets: Dict[str, List[Dict]] = defaultdict(list)
+
+        for market in markets:
+            volume = float(market.get('volume24hr', 0) or 0)
+            if volume <= min_volume:
+                continue
+
+            prices_str = market.get('outcomePrices', '[0.5, 0.5]')
+            try:
+                prices = json.loads(prices_str) if isinstance(prices_str, str) else prices_str
+                price = float(prices[0]) if prices else 0.5
+            except (TypeError, ValueError, json.JSONDecodeError):
+                price = 0.5
+
+            if price >= 0.95 or price <= 0.05:
+                continue
+
+            domain = self.infer_market_domain(market)
+            domain_buckets[domain].append(market)
+
+        for domain in domain_buckets:
+            domain_buckets[domain].sort(
+                key=lambda market_item: float(market_item.get('volume24hr', 0) or 0),
+                reverse=True,
+            )
+
+        selected: List[Dict] = []
+        domains = sorted(domain_buckets.keys(), key=lambda d: len(domain_buckets[d]), reverse=True)
+
+        while len(selected) < limit and domains:
+            next_domains = []
+            for domain in domains:
+                bucket = domain_buckets[domain]
+                if bucket and len(selected) < limit:
+                    selected.append(bucket.pop(0))
+                if bucket:
+                    next_domains.append(domain)
+            domains = next_domains
+
+        return selected
+     
     # =========================================================================
     # Real Training Data Methods (NO SYNTHETIC DATA)
     # =========================================================================
@@ -413,49 +589,105 @@ class PolymarketFetcher:
         self,
         n_markets: int = 50,
         min_volume: float = 1000,
-        include_closed: bool = False  # Disabled - CLOB returns 404 for closed markets
+        include_closed: bool = False,  # Disabled - CLOB returns 404 for closed markets
+        train_pool_size: Optional[int] = None,
+        force_refresh: bool = True,
     ) -> List[Dict]:
         """
-        Fetch REAL training data from Polymarket for ML model training.
-        
+        Fetch REAL training data from Polymarket and accumulate it in the DB.
+
         NO SYNTHETIC DATA - uses actual historical prices and outcomes.
         Uses price history to create training labels (price direction over time).
-        
+
+        Accumulation model:
+          1. Harvest up to `n_markets` FRESH samples from the API each call.
+          2. Persist them with dedup so the DB pool grows over time.
+          3. Return up to `train_pool_size` distinct accumulated samples for training
+             (defaults to the larger of n_markets and the whole pool).
+
         Args:
-            n_markets: Number of markets to fetch
-            min_volume: Minimum 24h volume filter
-            include_closed: Disabled - closed markets have no CLOB data
-        
-        Returns: List of training samples with real features and outcomes
+            n_markets: Number of FRESH markets to harvest this call.
+            min_volume: Minimum 24h volume filter.
+            include_closed: Disabled - closed markets have no CLOB data.
+            train_pool_size: Max distinct accumulated samples to return for training.
+            force_refresh: When True, always hit the API to grow the pool. When False,
+                a sufficiently large/diverse recent cache short-circuits the fetch.
+
+        Returns: List of training samples (the accumulated pool, deduped).
         """
         self._log("=" * 60)
         self._log("FETCHING REAL TRAINING DATA FROM POLYMARKET API")
         self._log("=" * 60)
-        
+
+        pool_target = max(int(train_pool_size) if train_pool_size else n_markets, n_markets)
+
+        # Optional fast path: only when refresh is NOT forced and we already have a rich cache.
+        if self.storage and not force_refresh:
+            cached_training = self.storage.load_training_samples(
+                limit=pool_target,
+                max_age_seconds=24 * 3600,
+            )
+            if len(cached_training) >= pool_target:
+                cached_domains = {
+                    self.infer_market_domain({'question': sample.get('question', '')})
+                    for sample in cached_training
+                }
+                timestamp_coverage = (
+                    sum(1 for sample in cached_training if sample.get('sample_timestamp')) / len(cached_training)
+                )
+                if len(cached_domains) >= 3 and timestamp_coverage >= 0.70:
+                    self._log(
+                        f"Loaded {len(cached_training)} training samples from persistent memory "
+                        f"across {len(cached_domains)} domains "
+                        f"(timestamps {timestamp_coverage:.0%})"
+                    )
+                    return cached_training
+
         training_data = []
-        
+
         # Fetch active markets for live price data
         self._log("\n📊 Fetching active markets with high volume...")
         active_markets = self.get_markets(
-            limit=n_markets * 3,  # Fetch more to account for filtering
+            limit=max(n_markets * 8, 300),  # Fetch more to diversify beyond sports
             active=True,
             closed=False,
             order='volume24hr',
             ascending=False
         )
-        
+
         self._log(f"Found {len(active_markets)} active markets")
-        
-        for market in active_markets:
+
+        candidate_markets = self.select_diverse_active_markets(
+            markets=active_markets,
+            limit=n_markets * 3,
+            min_volume=min_volume,
+        )
+        self._log(f"Selected {len(candidate_markets)} diverse market candidates")
+
+        for market in candidate_markets:
             sample = self._process_market_for_training(market, is_closed=False)
             if sample:
                 training_data.append(sample)
             if len(training_data) >= n_markets:
                 break
-        
-        # Note: Closed markets return 404 from CLOB API - cannot use them
-        # Training uses price history-based labels instead
-        
+
+        # Persist freshly harvested samples (dedup happens inside save_training_samples).
+        inserted = 0
+        if self.storage and training_data:
+            inserted = self.storage.save_training_samples(training_data, source="api")
+            total_pool = self.storage.count_training_samples()
+            self._log(
+                f"Harvested {len(training_data)} fresh samples "
+                f"({inserted} new) -> accumulated pool now {total_pool} distinct samples"
+            )
+
+        # Build the training pool from the accumulated, deduped history.
+        if self.storage:
+            pool = self.storage.load_training_samples(limit=pool_target)
+            if pool:
+                self._log(f"\n✅ Training pool: {len(pool)} accumulated samples (fresh this run: {len(training_data)})")
+                return pool
+
         self._log(f"\n✅ Total training samples: {len(training_data)}")
         return training_data
     
@@ -507,31 +739,56 @@ class PolymarketFetcher:
             
             # Get historical price data
             price_history = self.get_prices_history(yes_token, interval='1w', fidelity=60)
-            
-            # Calculate real momentum and volatility from price history
-            if len(price_history) >= 10:
-                prices_arr = price_history['price'].values
-                momentum = (prices_arr[-1] - prices_arr[0]) / max(prices_arr[0], 0.01)
-                volatility = np.std(np.diff(prices_arr)) if len(prices_arr) > 1 else 0.02
-                
-                # RSI-like calculation
-                changes = np.diff(prices_arr)
-                gains = np.mean(changes[changes > 0]) if len(changes[changes > 0]) > 0 else 0
-                losses = -np.mean(changes[changes < 0]) if len(changes[changes < 0]) > 0 else 0
+
+            sample_timestamp = int(time.time())
+            one_day_change = 0.0
+            one_week_change = 0.0
+            domain = self.infer_market_domain(market)
+            prices_arr = pd.to_numeric(price_history['price'], errors='coerce').dropna().values
+            time_arr = pd.to_datetime(price_history['timestamp'], errors='coerce')
+
+            if len(prices_arr) >= 30:
+                # Prevent data leakage: build features only from the historical "past" slice
+                # and define labels on the future slice.
+                split_idx = int(len(prices_arr) * 0.7)
+                split_idx = max(split_idx, 12)
+                split_idx = min(split_idx, len(prices_arr) - 3)
+
+                past_prices = prices_arr[:split_idx]
+                future_prices = prices_arr[split_idx:]
+
+                changes = np.diff(past_prices)
+                momentum = (past_prices[-1] - past_prices[0]) / max(past_prices[0], 0.01)
+                volatility = np.std(changes) if len(changes) > 0 else 0.02
+
+                gains = np.mean(changes[changes > 0]) if np.any(changes > 0) else 0
+                losses = -np.mean(changes[changes < 0]) if np.any(changes < 0) else 0
                 if losses > 0:
                     rs = gains / losses
                     rsi = 1 - (1 / (1 + rs))
                 else:
                     rsi = 0.5
+
+                day_window = min(24, len(past_prices) - 1)
+                week_window = min(7 * 24, len(past_prices) - 1)
+
+                if day_window > 0:
+                    anchor_price = past_prices[-(day_window + 1)]
+                    one_day_change = (past_prices[-1] - anchor_price) / max(anchor_price, 0.01)
+                if week_window > 0:
+                    anchor_price = past_prices[-(week_window + 1)]
+                    one_week_change = (past_prices[-1] - anchor_price) / max(anchor_price, 0.01)
+
+                training_price = float(np.clip(past_prices[-1], 0.01, 0.99))
+                forecast_horizon = min(5, len(future_prices))
+                future_price = float(np.clip(np.mean(future_prices[:forecast_horizon]), 0.01, 0.99))
+                outcome = 1 if future_price > training_price else 0
+
+                if len(time_arr) > split_idx - 1 and pd.notna(time_arr.iloc[split_idx - 1]):
+                    sample_timestamp = int(time_arr.iloc[split_idx - 1].timestamp())
             else:
-                # Fallback if no price history
-                momentum = 0.0
-                volatility = 0.02
-                rsi = 0.5
-            
-            # Price change metrics
-            one_day_change = float(market.get('oneDayPriceChange', 0) or 0)
-            one_week_change = float(market.get('oneWeekPriceChange', 0) or 0)
+                # Avoid low-quality labels when historical depth is too short.
+                return None
             
             # Get spread
             best_bid = float(market.get('bestBid', 0) or 0)
@@ -540,30 +797,8 @@ class PolymarketFetcher:
             
             # Skip markets at very extreme prices (>99% or <1%) - these are effectively resolved
             # No trading opportunity exists at these prices
-            if current_price > 0.99 or current_price < 0.01:
+            if training_price > 0.99 or training_price < 0.01:
                 return None
-            
-            # Determine outcome using PRICE HISTORY (not just current price)
-            # This creates better training labels based on actual price movement
-            if len(price_history) >= 20:
-                prices_arr = price_history['price'].values
-                # Use first half as "past" features, last price as "outcome"
-                mid_point = len(prices_arr) // 2
-                past_avg = np.mean(prices_arr[:mid_point])
-                recent_avg = np.mean(prices_arr[-5:])  # Last 5 points
-                
-                # Outcome: did price go UP (1) or DOWN (0)?
-                outcome = 1 if recent_avg > past_avg else 0
-                future_price = recent_avg
-                
-                # Use the mid-point price as "current" for training
-                # This simulates having past data and predicting future
-                training_price = prices_arr[mid_point]
-            else:
-                # Fallback: use momentum direction
-                outcome = 1 if momentum > 0 else 0
-                future_price = current_price
-                training_price = current_price
             
             # Build feature vector (same order as FeatureExtractor)
             features = np.array([
@@ -588,6 +823,8 @@ class PolymarketFetcher:
                 'question': market.get('question', 'Unknown')[:50],
                 'is_resolved': is_closed,
                 'volume': volume_total,
+                'domain': domain,
+                'sample_timestamp': sample_timestamp,
             }
             
         except Exception as e:

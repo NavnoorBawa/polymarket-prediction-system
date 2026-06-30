@@ -4,15 +4,23 @@ A state-of-the-art machine learning system for predicting Polymarket outcomes us
 
 ## Overview
 
-This project uses sophisticated ML algorithms including XGBoost, LightGBM, and stacking ensembles to analyze prediction markets on Polymarket and generate trading signals with confidence scores.
+This project uses sophisticated ML algorithms including XGBoost, LightGBM, CatBoost, and stacking ensembles to analyze prediction markets on Polymarket and generate trading signals with confidence scores.
 
 ## Features
 
 - **Advanced ML Models**: Combines XGBoost and LightGBM with stacking ensembles
+- **CatBoost Integration**: Ordered boosting model added to ensemble when available
 - **Real-time Market Analysis**: Fetches live trading data from Polymarket API
 - **Quantitative Metrics**: RSI, volatility, order book imbalance, expected value calculations
 - **Risk Management**: Kelly criterion position sizing and terminal risk adjustments
 - **Smart Filtering**: Automatically excludes resolved and low-volume markets
+- **Cross-Domain Sampling**: Training/predictions now prioritize domain diversity (not sports-only)
+- **Persistent Memory Layer**: Stores markets, price history, training samples, model runs, and predictions in a local DB (chDB when available)
+- **Predictive Validation**: Reports baseline lift, AUC, high-confidence hit rate, and signal verdict
+- **Comprehensive Reporting**: Detailed run reports with models, probabilities, timing, and decision rationale
+- **Trend Discovery Mode**: Scores and ranks all analyzed markets (trend signal + trend score) even when trade action is HOLD
+- **Class-Imbalance Hardening**: Ensemble now auto-applies class-balance settings across all classifiers
+- **Historical Data Accumulation**: Deduped training pool that grows across runs (`collect_data.py`), decoupling fresh harvest size from training pool size
 
 ## Components
 
@@ -47,7 +55,28 @@ python main.py
 
 # Analyze custom number of markets
 python main.py 20
+
+# Save detailed JSON report to a custom path
+python main.py 20 --report-file data\my_run_report.json
+
+# Run report-only entrypoint
+python final_report.py --markets 20 --report-file data\final_report.json
 ```
+
+### Accumulating historical training data
+
+The models improve as the persistent training pool grows. Use the collector to
+harvest fresh markets into the DB over time WITHOUT training:
+
+```bash
+# Harvest 40 fresh markets per iteration, 10 iterations, 5s apart
+python collect_data.py --iterations 10 --markets 40 --sleep 5
+```
+
+Samples are deduplicated on save (by content hash), so repeated runs grow the
+pool instead of creating duplicates. Training then loads the full accumulated
+pool (decoupled from the number of fresh markets harvested per run), which
+stabilizes balanced accuracy/AUC as more history accumulates.
 
 ## Output
 
@@ -56,8 +85,25 @@ The system provides:
 - Buy/Sell/Hold recommendations
 - Confidence scores
 - Trading signals (STRONG BUY, BUY, HOLD)
+- Trend signals and ranked watchlist across all analyzed markets
 - Key insights (RSI, volatility, order book pressure)
 - Kelly-optimized position sizes
+
+## Persistent Storage
+
+The app now keeps a local persistent memory database under `data/`:
+
+- `market_snapshots` - fetched market lists
+- `trade_snapshots` - recent trade batches per token
+- `price_history_points` - cached historical price points
+- `training_samples` - prepared training feature vectors/labels
+- `model_training_runs` - training metrics and run metadata
+- `prediction_runs` - generated predictions for traceability
+- `run_reports` - full run-level report payloads (timing, models, metrics, predictions)
+
+Backend selection:
+- **chDB** is used automatically when available
+- **SQLite** fallback is used on platforms where chDB wheels are unavailable (e.g., Windows)
 
 ## Requirements
 
